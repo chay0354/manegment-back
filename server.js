@@ -31,6 +31,9 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+// Root (for Vercel / health checks)
+app.get('/', (req, res) => res.json({ service: 'maneger-back', health: '/health', api: '/api' }));
+
 // ---------- Projects ----------
 app.get('/api/projects', async (req, res) => {
   try {
