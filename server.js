@@ -311,6 +311,60 @@ app.delete('/api/projects/:id/members/:userId', async (req, res) => {
   }
 });
 
+// ---------- Project chat (any member can read/write) ----------
+app.get('/api/projects/:id/chat', async (req, res) => {
+  try {
+    const user = await getCurrentUser(req);
+    const projectId = req.params.id;
+    const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const hasMembers = await projectHasMembers(projectId);
+    const access = hasMembers ? await getProjectAccess(projectId, user?.id) : { canAccess: !!user, role: user ? 'owner' : null };
+    if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
+    const { data, error } = await supabase.from('project_chat_messages').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+    if (error) {
+      if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
+        return res.json({ messages: [] });
+      }
+      throw error;
+    }
+    res.json({ messages: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:id/chat', async (req, res) => {
+  try {
+    const user = await getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const projectId = req.params.id;
+    const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const hasMembers = await projectHasMembers(projectId);
+    const access = hasMembers ? await getProjectAccess(projectId, user.id) : { canAccess: true, role: 'owner' };
+    if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
+    const body = (req.body && req.body.body) ? String(req.body.body).trim() : '';
+    if (!body) return res.status(400).json({ error: 'body is required' });
+    await upsertUserCache(user.id, user.username);
+    const { data: row, error } = await supabase.from('project_chat_messages').insert({
+      project_id: projectId,
+      user_id: user.id,
+      username: user.username || 'User',
+      body
+    }).select().single();
+    if (error) {
+      if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
+        return res.status(503).json({ error: 'Chat not available. Run project_chat_messages in supabase_schema.sql.' });
+      }
+      throw error;
+    }
+    res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Tasks ----------
 app.get('/api/projects/:projectId/tasks', async (req, res) => {
   try {
@@ -754,7 +808,11 @@ app.post('/api/rag/research/session', async (req, res) => {
 // ---------- Health ----------
 app.get('/health', (req, res) => res.json({ ok: true, service: 'maneger-back' }));
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Maneger API running on http://0.0.0.0:${PORT}`);
-  if (!MATRIYA_BACK_URL) console.warn('MATRIYA_BACK_URL not set – RAG features disabled');
-});
+// Vercel uses this as the serverless handler; locally we start the HTTP server
+if (!process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Maneger API running on http://0.0.0.0:${PORT}`);
+    if (!MATRIYA_BACK_URL) console.warn('MATRIYA_BACK_URL not set – RAG features disabled');
+  });
+}
+export default app;

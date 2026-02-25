@@ -103,6 +103,17 @@ CREATE TABLE IF NOT EXISTS project_join_requests (
 CREATE INDEX IF NOT EXISTS project_join_requests_project_id_idx ON project_join_requests(project_id);
 CREATE INDEX IF NOT EXISTS project_join_requests_status_idx ON project_join_requests(project_id, status);
 
+-- Project chat (any project member can read/write)
+CREATE TABLE IF NOT EXISTS project_chat_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  username TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS project_chat_messages_project_id_idx ON project_chat_messages(project_id);
+
 -- Optional: enable RLS and add policies in Supabase Dashboard if you use anon key from frontend.
 --
 -- If tasks table already existed with old status constraint, run to add 'in_review':
