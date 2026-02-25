@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS project_chat_messages (
 );
 CREATE INDEX IF NOT EXISTS project_chat_messages_project_id_idx ON project_chat_messages(project_id);
 
+-- Audit log (light governance – every mutation logged; non-blocking)
+CREATE TABLE IF NOT EXISTS audit_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+  user_id INTEGER,
+  username TEXT,
+  action TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT,
+  details JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS audit_log_project_id_idx ON audit_log(project_id);
+CREATE INDEX IF NOT EXISTS audit_log_created_at_idx ON audit_log(created_at);
+
 -- Optional: enable RLS and add policies in Supabase Dashboard if you use anon key from frontend.
 --
 -- If tasks table already existed with old status constraint, run to add 'in_review':

@@ -76,6 +76,7 @@ app.post('/api/projects', async (req, res) => {
       }
       throw errMember;
     }
+    auditLog(project.id, user.id, user.username, 'create', 'project', project.id, { name: project.name });
     res.status(201).json(project);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -130,12 +131,17 @@ app.get('/api/projects/:id', async (req, res) => {
 
 app.patch('/api/projects/:id', async (req, res) => {
   try {
+    const user = await getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const { data: member } = await supabase.from('project_members').select('role').eq('project_id', req.params.id).eq('user_id', user.id).single();
+    if (!member || member.role !== 'owner') return res.status(403).json({ error: 'Only project owner can update' });
     const { name, description } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
     if (name !== undefined) updates.name = name.trim();
     if (description !== undefined) updates.description = description.trim() || null;
     const { data, error } = await supabase.from('projects').update(updates).eq('id', req.params.id).select().single();
     if (error) throw error;
+    auditLog(req.params.id, user.id, user.username, 'update', 'project', data.id);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -150,6 +156,7 @@ app.delete('/api/projects/:id', async (req, res) => {
     if (!member || member.role !== 'owner') return res.status(403).json({ error: 'Only project owner can delete' });
     const { error } = await supabase.from('projects').delete().eq('id', req.params.id);
     if (error) throw error;
+    auditLog(req.params.id, user.id, user.username, 'delete', 'project', req.params.id);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -204,6 +211,7 @@ app.post('/api/projects/:id/requests/:requestId/approve', async (req, res) => {
     if (!reqRow) return res.status(404).json({ error: 'Request not found' });
     await supabase.from('project_members').insert({ project_id: req.params.id, user_id: reqRow.user_id, role: 'member' });
     await supabase.from('project_join_requests').update({ status: 'approved' }).eq('id', req.params.requestId);
+    auditLog(req.params.id, user.id, user.username, 'request_approve', 'project_join_request', req.params.requestId, { username: reqRow.username });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -217,6 +225,7 @@ app.post('/api/projects/:id/requests/:requestId/reject', async (req, res) => {
     const { data: owner } = await supabase.from('project_members').select('id').eq('project_id', req.params.id).eq('user_id', user.id).eq('role', 'owner').single();
     if (!owner) return res.status(403).json({ error: 'Only project owner can reject' });
     await supabase.from('project_join_requests').update({ status: 'rejected' }).eq('id', req.params.requestId).eq('project_id', req.params.id);
+    auditLog(req.params.id, user.id, user.username, 'request_reject', 'project_join_request', req.params.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -289,6 +298,7 @@ app.post('/api/projects/:id/members', async (req, res) => {
       if (err.code === '23505') return res.status(400).json({ error: 'Already a member' });
       throw err;
     }
+    auditLog(req.params.id, user.id, user.username, 'member_add', 'project_member', cached.user_id, { username: un });
     res.status(201).json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -308,6 +318,7 @@ app.delete('/api/projects/:id/members/:userId', async (req, res) => {
     if (target.role === 'owner') return res.status(400).json({ error: 'Cannot remove project owner' });
     const { error } = await supabase.from('project_members').delete().eq('project_id', req.params.id).eq('user_id', targetUserId);
     if (error) throw error;
+    auditLog(req.params.id, user.id, user.username, 'member_remove', 'project_member', targetUserId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -362,6 +373,7 @@ app.post('/api/projects/:id/chat', async (req, res) => {
       }
       throw error;
     }
+    auditLog(projectId, user.id, user.username, 'create', 'chat_message', row.id);
     res.status(201).json(row);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -371,6 +383,8 @@ app.post('/api/projects/:id/chat', async (req, res) => {
 // ---------- Tasks ----------
 app.get('/api/projects/:projectId/tasks', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { data, error } = await supabase.from('tasks').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ tasks: data || [] });
@@ -381,6 +395,8 @@ app.get('/api/projects/:projectId/tasks', async (req, res) => {
 
 app.post('/api/projects/:projectId/tasks', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, status, priority, due_date } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' });
     const { data, error } = await supabase.from('tasks').insert({
@@ -391,6 +407,7 @@ app.post('/api/projects/:projectId/tasks', async (req, res) => {
       due_date: due_date || null
     }).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'task', data.id, { title: data.title });
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -399,7 +416,16 @@ app.post('/api/projects/:projectId/tasks', async (req, res) => {
 
 app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
   try {
-    const { title, status, priority, due_date } = req.body || {};
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { status } = req.body || {};
+    if (status !== undefined) {
+      const { data: current } = await supabase.from('tasks').select('status').eq('id', req.params.taskId).eq('project_id', req.params.projectId).single();
+      if (current && !isAllowedTaskStatusTransition(current.status, status)) {
+        return res.status(400).json({ error: `Invalid status transition: ${current.status} → ${status}` });
+      }
+    }
+    const { title, priority, due_date } = req.body || {};
     const updates = {};
     if (title !== undefined) updates.title = title.trim();
     if (status !== undefined) updates.status = status;
@@ -407,6 +433,7 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     if (due_date !== undefined) updates.due_date = due_date || null;
     const { data, error } = await supabase.from('tasks').update(updates).eq('id', req.params.taskId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'task', data.id, { status: data.status });
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -415,8 +442,11 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
 
 app.delete('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { error } = await supabase.from('tasks').delete().eq('id', req.params.taskId).eq('project_id', req.params.projectId);
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'task', req.params.taskId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -426,6 +456,8 @@ app.delete('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
 // ---------- Milestones ----------
 app.get('/api/projects/:projectId/milestones', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { data, error } = await supabase.from('milestones').select('*').eq('project_id', req.params.projectId).order('due_date', { ascending: true });
     if (error) throw error;
     res.json({ milestones: data || [] });
@@ -436,6 +468,8 @@ app.get('/api/projects/:projectId/milestones', async (req, res) => {
 
 app.post('/api/projects/:projectId/milestones', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, due_date, description } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' });
     const { data, error } = await supabase.from('milestones').insert({
@@ -446,6 +480,7 @@ app.post('/api/projects/:projectId/milestones', async (req, res) => {
       completed_at: null
     }).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'milestone', data.id, { title: data.title });
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -454,6 +489,8 @@ app.post('/api/projects/:projectId/milestones', async (req, res) => {
 
 app.patch('/api/projects/:projectId/milestones/:milestoneId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, due_date, description, completed_at } = req.body || {};
     const updates = {};
     if (title !== undefined) updates.title = title.trim();
@@ -462,6 +499,7 @@ app.patch('/api/projects/:projectId/milestones/:milestoneId', async (req, res) =
     if (completed_at !== undefined) updates.completed_at = completed_at || null;
     const { data, error } = await supabase.from('milestones').update(updates).eq('id', req.params.milestoneId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'milestone', data.id);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -470,8 +508,11 @@ app.patch('/api/projects/:projectId/milestones/:milestoneId', async (req, res) =
 
 app.delete('/api/projects/:projectId/milestones/:milestoneId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { error } = await supabase.from('milestones').delete().eq('id', req.params.milestoneId).eq('project_id', req.params.projectId);
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'milestone', req.params.milestoneId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -481,6 +522,8 @@ app.delete('/api/projects/:projectId/milestones/:milestoneId', async (req, res) 
 // ---------- Documents ----------
 app.get('/api/projects/:projectId/documents', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { data, error } = await supabase.from('documents').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false });
     if (error) throw error;
     res.json({ documents: data || [] });
@@ -491,6 +534,8 @@ app.get('/api/projects/:projectId/documents', async (req, res) => {
 
 app.post('/api/projects/:projectId/documents', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, content } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' });
     const { data, error } = await supabase.from('documents').insert({
@@ -499,6 +544,7 @@ app.post('/api/projects/:projectId/documents', async (req, res) => {
       content: (content || '').trim() || null
     }).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'document', data.id, { title: data.title });
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -507,12 +553,15 @@ app.post('/api/projects/:projectId/documents', async (req, res) => {
 
 app.patch('/api/projects/:projectId/documents/:docId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, content } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
     if (title !== undefined) updates.title = title.trim();
     if (content !== undefined) updates.content = content.trim() || null;
     const { data, error } = await supabase.from('documents').update(updates).eq('id', req.params.docId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'document', data.id);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -521,8 +570,11 @@ app.patch('/api/projects/:projectId/documents/:docId', async (req, res) => {
 
 app.delete('/api/projects/:projectId/documents/:docId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { error } = await supabase.from('documents').delete().eq('id', req.params.docId).eq('project_id', req.params.projectId);
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'document', req.params.docId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -532,6 +584,8 @@ app.delete('/api/projects/:projectId/documents/:docId', async (req, res) => {
 // ---------- Notes ----------
 app.get('/api/projects/:projectId/notes', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { data, error } = await supabase.from('notes').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false });
     if (error) throw error;
     res.json({ notes: data || [] });
@@ -542,6 +596,8 @@ app.get('/api/projects/:projectId/notes', async (req, res) => {
 
 app.post('/api/projects/:projectId/notes', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, body } = req.body || {};
     const { data, error } = await supabase.from('notes').insert({
       project_id: req.params.projectId,
@@ -549,6 +605,7 @@ app.post('/api/projects/:projectId/notes', async (req, res) => {
       body: (body || '').trim() || null
     }).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'note', data.id);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -557,12 +614,15 @@ app.post('/api/projects/:projectId/notes', async (req, res) => {
 
 app.patch('/api/projects/:projectId/notes/:noteId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { title, body } = req.body || {};
     const updates = { updated_at: new Date().toISOString() };
     if (title !== undefined) updates.title = title.trim();
     if (body !== undefined) updates.body = body.trim() || null;
     const { data, error } = await supabase.from('notes').update(updates).eq('id', req.params.noteId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'note', data.id);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -571,8 +631,11 @@ app.patch('/api/projects/:projectId/notes/:noteId', async (req, res) => {
 
 app.delete('/api/projects/:projectId/notes/:noteId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { error } = await supabase.from('notes').delete().eq('id', req.params.noteId).eq('project_id', req.params.projectId);
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'note', req.params.noteId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -671,13 +734,56 @@ function projectHasMembers(projectId) {
   return supabase.from('project_members').select('id', { count: 'exact', head: true }).eq('project_id', projectId).then(r => (r.count || 0) > 0);
 }
 
+// ---------- RBAC: require project member (returns access or sends 403) ----------
+async function requireProjectMember(req, res, projectId) {
+  const user = await getCurrentUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return null;
+  }
+  const hasMembers = await projectHasMembers(projectId);
+  const access = hasMembers ? await getProjectAccess(projectId, user.id) : { canAccess: !!user, role: user ? 'owner' : null };
+  if (!access.canAccess) {
+    res.status(403).json({ error: 'Not a project member' });
+    return null;
+  }
+  return { user, access };
+}
+
+// ---------- Audit log (fire-and-forget; never fails the request) ----------
+function auditLog(projectId, userId, username, action, entityType, entityId = null, details = null) {
+  supabase.from('audit_log').insert({
+    project_id: projectId || null,
+    user_id: userId ?? null,
+    username: username || null,
+    action,
+    entity_type: entityType,
+    entity_id: entityId ? String(entityId) : null,
+    details: details && typeof details === 'object' ? details : null
+  }).then(() => {}).catch(() => {});
+}
+
+// ---------- Task status state machine (allowed transitions) ----------
+const TASK_STATUS_TRANSITIONS = {
+  todo: ['in_progress', 'cancelled'],
+  in_progress: ['todo', 'in_review', 'cancelled'],
+  in_review: ['in_progress', 'done', 'cancelled'],
+  done: [],
+  cancelled: []
+};
+function isAllowedTaskStatusTransition(fromStatus, toStatus) {
+  const allowed = TASK_STATUS_TRANSITIONS[fromStatus];
+  return Array.isArray(allowed) && allowed.includes(toStatus);
+}
+
 // ---------- Project files (upload → Matriya ingest, metadata in Supabase) ----------
 app.get('/api/projects/:projectId/files', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { data, error } = await supabase.from('project_files').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false });
     if (error) {
       const msg = String(error.message || error);
-      // If table is missing, return empty list so opening a project still works; run full schema to enable files.
       if (msg.includes('does not exist') || msg.includes('relation') || msg.includes('project_files')) {
         console.warn('project_files table missing – run full supabase_schema.sql to enable files. Returning empty list.');
         return res.json({ files: [] });
@@ -693,6 +799,8 @@ app.get('/api/projects/:projectId/files', async (req, res) => {
 
 app.post('/api/projects/:projectId/files', upload.single('file'), async (req, res) => {
   const projectId = req.params.projectId;
+  const ctx = await requireProjectMember(req, res, projectId);
+  if (!ctx) return;
   if (!req.file) {
     return res.status(400).json({ error: 'No file provided' });
   }
@@ -719,6 +827,7 @@ app.post('/api/projects/:projectId/files', upload.single('file'), async (req, re
       original_name: originalName
     }).select().single();
     if (error) throw error;
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', data.id, { original_name: originalName });
     res.status(201).json(data);
   } catch (e) {
     const status = e.response?.status || 500;
@@ -729,8 +838,11 @@ app.post('/api/projects/:projectId/files', upload.single('file'), async (req, re
 
 app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
   try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
     const { error } = await supabase.from('project_files').delete().eq('id', req.params.fileId).eq('project_id', req.params.projectId);
     if (error) throw error;
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', req.params.fileId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
