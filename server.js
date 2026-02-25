@@ -608,9 +608,17 @@ function forwardAuth(method, path, req, res) {
       res.status(r.status).json(data);
     })
     .catch(e => {
-      const status = e.response?.status || 500;
-      const data = e.response?.data || { error: e.message };
-      res.status(status).json(typeof data === 'object' ? data : { error: e.message });
+      const code = e.code || '';
+      const statusFromMatriya = e.response?.status;
+      const bodyFromMatriya = e.response?.data;
+      console.error(`Auth forward ${method} ${path} →`, code || statusFromMatriya, bodyFromMatriya || e.message);
+      if (statusFromMatriya != null) {
+        return res.status(statusFromMatriya).json(typeof bodyFromMatriya === 'object' ? bodyFromMatriya : { error: e.message });
+      }
+      if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ETIMEDOUT') {
+        return res.status(503).json({ error: 'Cannot reach Matriya. Is it running? Check MATRIYA_BACK_URL in .env.' });
+      }
+      res.status(500).json({ error: bodyFromMatriya?.error || e.message || 'Auth request failed' });
     });
 }
 
