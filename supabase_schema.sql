@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS project_chat_messages (
 );
 CREATE INDEX IF NOT EXISTS project_chat_messages_project_id_idx ON project_chat_messages(project_id);
 
--- Audit log (light governance – every mutation logged; non-blocking)
+-- Audit log (actor, entity, action, before/after, request_id)
 CREATE TABLE IF NOT EXISTS audit_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
@@ -124,10 +124,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
   entity_type TEXT NOT NULL,
   entity_id TEXT,
   details JSONB,
+  request_id TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS audit_log_project_id_idx ON audit_log(project_id);
 CREATE INDEX IF NOT EXISTS audit_log_created_at_idx ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS audit_log_request_id_idx ON audit_log(request_id);
 
 -- Runs (per project): feature tagging + FSM trace
 CREATE TABLE IF NOT EXISTS runs (
@@ -141,6 +143,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_project_id_idx ON runs(project_id);
 CREATE INDEX IF NOT EXISTS runs_status_idx ON runs(project_id, status);
+CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs(project_id, created_at DESC);
 
 -- FSM transition trace per run (from → to, timestamp, ruleId optional)
 CREATE TABLE IF NOT EXISTS run_fsm_trace (
@@ -152,6 +155,12 @@ CREATE TABLE IF NOT EXISTS run_fsm_trace (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS run_fsm_trace_run_id_idx ON run_fsm_trace(run_id);
+
+-- If audit_log already exists without request_id, run:
+-- ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS request_id TEXT;
+-- CREATE INDEX IF NOT EXISTS audit_log_request_id_idx ON audit_log(request_id);
+-- If runs table exists, add index for pagination:
+-- CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs(project_id, created_at DESC);
 
 -- Optional: enable RLS and add policies in Supabase Dashboard if you use anon key from frontend.
 --

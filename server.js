@@ -3,12 +3,15 @@
  * Features: projects, tasks, milestones, documents, notes, file upload (→ Matriya), RAG (proxy to Matriya back).
  */
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 import FormData from 'form-data';
+import { z } from 'zod';
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -24,12 +27,34 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// Request ID for audit (actor, entity, action, before/after, request_id)
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  next();
+});
+
+// Rate limiting: auth strict, upload/chat/rag moderate, general API relaxed
+const limiterAuth = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Too many auth attempts' } });
+const limiterUpload = rateLimit({ windowMs: 60 * 1000, max: 15, message: { error: 'Too many uploads' } });
+const limiterRag = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Too many RAG requests' } });
+const limiterGeneral = rateLimit({ windowMs: 60 * 1000, max: 200, message: { error: 'Too many requests' } });
+app.use('/api/auth', limiterAuth);
+app.use('/api/rag', limiterRag);
+app.use(limiterGeneral);
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }
 });
+
+// Pagination: ?limit=50&offset=0 (limit 1–100, default 50)
+function parsePagination(req) {
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  return { limit, offset };
+}
 
 // Root (for Vercel / health checks)
 app.get('/', (req, res) => res.json({ service: 'maneger-back', health: '/health', api: '/api' }));
@@ -37,9 +62,10 @@ app.get('/', (req, res) => res.json({ service: 'maneger-back', health: '/health'
 // ---------- Projects ----------
 app.get('/api/projects', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('projects').select('*').order('updated_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('projects').select('*').order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ projects: data || [] });
+    res.json({ projects: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -76,7 +102,7 @@ app.post('/api/projects', async (req, res) => {
       }
       throw errMember;
     }
-    auditLog(project.id, user.id, user.username, 'create', 'project', project.id, { name: project.name });
+    auditLog(project.id, user.id, user.username, 'create', 'project', project.id, { name: project.name }, req.requestId);
     res.status(201).json(project);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -141,7 +167,7 @@ app.patch('/api/projects/:id', async (req, res) => {
     if (description !== undefined) updates.description = description.trim() || null;
     const { data, error } = await supabase.from('projects').update(updates).eq('id', req.params.id).select().single();
     if (error) throw error;
-    auditLog(req.params.id, user.id, user.username, 'update', 'project', data.id);
+    auditLog(req.params.id, user.id, user.username, 'update', 'project', data.id, null, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -156,7 +182,7 @@ app.delete('/api/projects/:id', async (req, res) => {
     if (!member || member.role !== 'owner') return res.status(403).json({ error: 'Only project owner can delete' });
     const { error } = await supabase.from('projects').delete().eq('id', req.params.id);
     if (error) throw error;
-    auditLog(req.params.id, user.id, user.username, 'delete', 'project', req.params.id);
+    auditLog(req.params.id, user.id, user.username, 'delete', 'project', req.params.id, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -211,7 +237,7 @@ app.post('/api/projects/:id/requests/:requestId/approve', async (req, res) => {
     if (!reqRow) return res.status(404).json({ error: 'Request not found' });
     await supabase.from('project_members').insert({ project_id: req.params.id, user_id: reqRow.user_id, role: 'member' });
     await supabase.from('project_join_requests').update({ status: 'approved' }).eq('id', req.params.requestId);
-    auditLog(req.params.id, user.id, user.username, 'request_approve', 'project_join_request', req.params.requestId, { username: reqRow.username });
+    auditLog(req.params.id, user.id, user.username, 'request_approve', 'project_join_request', req.params.requestId, { username: reqRow.username }, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -225,7 +251,7 @@ app.post('/api/projects/:id/requests/:requestId/reject', async (req, res) => {
     const { data: owner } = await supabase.from('project_members').select('id').eq('project_id', req.params.id).eq('user_id', user.id).eq('role', 'owner').single();
     if (!owner) return res.status(403).json({ error: 'Only project owner can reject' });
     await supabase.from('project_join_requests').update({ status: 'rejected' }).eq('id', req.params.requestId).eq('project_id', req.params.id);
-    auditLog(req.params.id, user.id, user.username, 'request_reject', 'project_join_request', req.params.requestId);
+    auditLog(req.params.id, user.id, user.username, 'request_reject', 'project_join_request', req.params.requestId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -298,7 +324,7 @@ app.post('/api/projects/:id/members', async (req, res) => {
       if (err.code === '23505') return res.status(400).json({ error: 'Already a member' });
       throw err;
     }
-    auditLog(req.params.id, user.id, user.username, 'member_add', 'project_member', cached.user_id, { username: un });
+    auditLog(req.params.id, user.id, user.username, 'member_add', 'project_member', cached.user_id, { username: un }, req.requestId);
     res.status(201).json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -318,7 +344,7 @@ app.delete('/api/projects/:id/members/:userId', async (req, res) => {
     if (target.role === 'owner') return res.status(400).json({ error: 'Cannot remove project owner' });
     const { error } = await supabase.from('project_members').delete().eq('project_id', req.params.id).eq('user_id', targetUserId);
     if (error) throw error;
-    auditLog(req.params.id, user.id, user.username, 'member_remove', 'project_member', targetUserId);
+    auditLog(req.params.id, user.id, user.username, 'member_remove', 'project_member', targetUserId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -335,14 +361,15 @@ app.get('/api/projects/:id/chat', async (req, res) => {
     const hasMembers = await projectHasMembers(projectId);
     const access = hasMembers ? await getProjectAccess(projectId, user?.id) : { canAccess: !!user, role: user ? 'owner' : null };
     if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
-    const { data, error } = await supabase.from('project_chat_messages').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('project_chat_messages').select('*').eq('project_id', projectId).order('created_at', { ascending: true }).range(offset, offset + limit - 1);
     if (error) {
       if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
-        return res.json({ messages: [] });
+        return res.json({ messages: [], limit, offset });
       }
       throw error;
     }
-    res.json({ messages: data || [] });
+    res.json({ messages: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -373,7 +400,7 @@ app.post('/api/projects/:id/chat', async (req, res) => {
       }
       throw error;
     }
-    auditLog(projectId, user.id, user.username, 'create', 'chat_message', row.id);
+    auditLog(projectId, user.id, user.username, 'create', 'chat_message', row.id, null, req.requestId);
     res.status(201).json(row);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -385,9 +412,10 @@ app.get('/api/projects/:projectId/tasks', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { data, error } = await supabase.from('tasks').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('tasks').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ tasks: data || [] });
+    res.json({ tasks: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -397,8 +425,9 @@ app.post('/api/projects/:projectId/tasks', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { title, status, priority, due_date } = req.body || {};
-    if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' });
+    const parsed = taskCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { title, status, priority, due_date } = parsed.data;
     const { data, error } = await supabase.from('tasks').insert({
       project_id: req.params.projectId,
       title: title.trim(),
@@ -407,7 +436,7 @@ app.post('/api/projects/:projectId/tasks', async (req, res) => {
       due_date: due_date || null
     }).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'task', data.id, { title: data.title });
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'task', data.id, { title: data.title }, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -418,14 +447,17 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { status } = req.body || {};
+    const parsed = taskPatchSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { status, title, priority, due_date } = parsed.data || {};
+    let current = null;
     if (status !== undefined) {
-      const { data: current } = await supabase.from('tasks').select('status').eq('id', req.params.taskId).eq('project_id', req.params.projectId).single();
+      const { data: cur } = await supabase.from('tasks').select('status').eq('id', req.params.taskId).eq('project_id', req.params.projectId).single();
+      current = cur;
       if (current && !isAllowedTaskStatusTransition(current.status, status)) {
         return res.status(409).json({ error: `Invalid status transition: ${current.status} → ${status}`, invalid_transition: true, from: current.status, to: status });
       }
     }
-    const { title, priority, due_date } = req.body || {};
     const updates = {};
     if (title !== undefined) updates.title = title.trim();
     if (status !== undefined) updates.status = status;
@@ -434,7 +466,7 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     const { data, error } = await supabase.from('tasks').update(updates).eq('id', req.params.taskId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
     const details = status !== undefined ? { before: { status: current?.status }, after: { status: data.status } } : {};
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'task', data.id, Object.keys(details).length ? details : { title: data.title });
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'task', data.id, Object.keys(details).length ? details : { title: data.title }, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -447,7 +479,7 @@ app.delete('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     if (!ctx) return;
     const { error } = await supabase.from('tasks').delete().eq('id', req.params.taskId).eq('project_id', req.params.projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'task', req.params.taskId);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'task', req.params.taskId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -459,9 +491,10 @@ app.get('/api/projects/:projectId/milestones', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { data, error } = await supabase.from('milestones').select('*').eq('project_id', req.params.projectId).order('due_date', { ascending: true });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('milestones').select('*').eq('project_id', req.params.projectId).order('due_date', { ascending: true }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ milestones: data || [] });
+    res.json({ milestones: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -481,7 +514,7 @@ app.post('/api/projects/:projectId/milestones', async (req, res) => {
       completed_at: null
     }).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'milestone', data.id, { title: data.title });
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'milestone', data.id, { title: data.title }, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -500,7 +533,7 @@ app.patch('/api/projects/:projectId/milestones/:milestoneId', async (req, res) =
     if (completed_at !== undefined) updates.completed_at = completed_at || null;
     const { data, error } = await supabase.from('milestones').update(updates).eq('id', req.params.milestoneId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'milestone', data.id);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'milestone', data.id, null, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -513,7 +546,7 @@ app.delete('/api/projects/:projectId/milestones/:milestoneId', async (req, res) 
     if (!ctx) return;
     const { error } = await supabase.from('milestones').delete().eq('id', req.params.milestoneId).eq('project_id', req.params.projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'milestone', req.params.milestoneId);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'milestone', req.params.milestoneId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -525,9 +558,10 @@ app.get('/api/projects/:projectId/documents', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { data, error } = await supabase.from('documents').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('documents').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ documents: data || [] });
+    res.json({ documents: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -545,7 +579,7 @@ app.post('/api/projects/:projectId/documents', async (req, res) => {
       content: (content || '').trim() || null
     }).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'document', data.id, { title: data.title });
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'document', data.id, { title: data.title }, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -562,7 +596,7 @@ app.patch('/api/projects/:projectId/documents/:docId', async (req, res) => {
     if (content !== undefined) updates.content = content.trim() || null;
     const { data, error } = await supabase.from('documents').update(updates).eq('id', req.params.docId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'document', data.id);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'document', data.id, null, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -575,7 +609,7 @@ app.delete('/api/projects/:projectId/documents/:docId', async (req, res) => {
     if (!ctx) return;
     const { error } = await supabase.from('documents').delete().eq('id', req.params.docId).eq('project_id', req.params.projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'document', req.params.docId);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'document', req.params.docId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -587,9 +621,10 @@ app.get('/api/projects/:projectId/notes', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { data, error } = await supabase.from('notes').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('notes').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ notes: data || [] });
+    res.json({ notes: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -606,7 +641,7 @@ app.post('/api/projects/:projectId/notes', async (req, res) => {
       body: (body || '').trim() || null
     }).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'note', data.id);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'create', 'note', data.id, null, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -623,7 +658,7 @@ app.patch('/api/projects/:projectId/notes/:noteId', async (req, res) => {
     if (body !== undefined) updates.body = body.trim() || null;
     const { data, error } = await supabase.from('notes').update(updates).eq('id', req.params.noteId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'note', data.id);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'note', data.id, null, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -636,7 +671,7 @@ app.delete('/api/projects/:projectId/notes/:noteId', async (req, res) => {
     if (!ctx) return;
     const { error } = await supabase.from('notes').delete().eq('id', req.params.noteId).eq('project_id', req.params.projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'note', req.params.noteId);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'note', req.params.noteId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -756,8 +791,8 @@ async function requireProjectMember(req, res, projectId) {
   return { user, access };
 }
 
-// ---------- Audit log (fire-and-forget; never fails the request) ----------
-function auditLog(projectId, userId, username, action, entityType, entityId = null, details = null) {
+// ---------- Audit log (actor, entity, action, before/after, request_id) ----------
+function auditLog(projectId, userId, username, action, entityType, entityId = null, details = null, requestId = null) {
   supabase.from('audit_log').insert({
     project_id: projectId || null,
     user_id: userId ?? null,
@@ -765,7 +800,8 @@ function auditLog(projectId, userId, username, action, entityType, entityId = nu
     action,
     entity_type: entityType,
     entity_id: entityId ? String(entityId) : null,
-    details: details && typeof details === 'object' ? details : null
+    details: details && typeof details === 'object' ? details : null,
+    request_id: requestId || null
   }).then(() => {}).catch(() => {});
 }
 
@@ -782,10 +818,34 @@ function isAllowedTaskStatusTransition(fromStatus, toStatus) {
   return Array.isArray(allowed) && allowed.includes(toStatus);
 }
 
-// ---------- Runs: controlled vocabulary (feature tagging + status) ----------
+// ---------- Validation (Zod) for critical payloads ----------
 const RUN_STATUSES = ['draft', 'running', 'completed', 'failed'];
 const RUN_FEATURES_CORE = ['research', 'analysis', 'export', 'report', 'doe', 'integrity'];
 const RUN_FEATURES_EXTENDED = ['tagged', 'reviewed', 'archived', 'priority'];
+
+const runCreateSchema = z.object({
+  features_core: z.array(z.string()).optional().default([]),
+  features_extended: z.array(z.string()).optional().default([]),
+  status: z.string().optional().default('draft')
+});
+const runPatchSchema = z.object({
+  status: z.string().optional(),
+  features_core: z.array(z.string()).optional(),
+  features_extended: z.array(z.string()).optional(),
+  rule_id: z.string().nullable().optional()
+});
+const taskCreateSchema = z.object({
+  title: z.string().min(1).max(500),
+  status: z.string().optional().default('todo'),
+  priority: z.string().optional().default('medium'),
+  due_date: z.union([z.string(), z.null()]).optional()
+});
+const taskPatchSchema = z.object({
+  title: z.string().min(1).max(500).optional(),
+  status: z.string().optional(),
+  priority: z.string().optional(),
+  due_date: z.union([z.string(), z.null()]).optional()
+});
 
 function validateRunFeatures(core = [], extended = []) {
   const coreArr = Array.isArray(core) ? core : [];
@@ -822,14 +882,15 @@ app.get('/api/projects/:projectId/runs', async (req, res) => {
         q = q.or(orClauses.join(','));
       }
     }
-    const { data, error } = await q.order('created_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await q.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) {
       if (String(error.message || '').includes('relation') || String(error.message || '').includes('does not exist')) {
-        return res.json({ runs: [] });
+        return res.json({ runs: [], limit, offset });
       }
       throw error;
     }
-    res.json({ runs: data || [] });
+    res.json({ runs: data || [], limit, offset });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -840,8 +901,10 @@ app.post('/api/projects/:projectId/runs', async (req, res) => {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
     const projectId = req.params.projectId;
-    const { features_core: fc, features_extended: fe, status } = req.body || {};
-    const validStatus = status && RUN_STATUSES.includes(status) ? status : 'draft';
+    const parsed = runCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { status: rawStatus, features_core: fc, features_extended: fe } = parsed.data;
+    const validStatus = rawStatus && RUN_STATUSES.includes(rawStatus) ? rawStatus : 'draft';
     const validation = validateRunFeatures(fc, fe);
     if (!validation.ok) return res.status(400).json({ error: validation.error });
     const { data, error } = await supabase.from('runs').insert({
@@ -852,7 +915,7 @@ app.post('/api/projects/:projectId/runs', async (req, res) => {
     }).select().single();
     if (error) throw error;
     appendRunTrace(data.id, null, data.status, null);
-    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'run', data.id);
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'run', data.id, null, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -877,7 +940,9 @@ app.patch('/api/projects/:projectId/runs/:runId', async (req, res) => {
     if (!ctx) return;
     const projectId = req.params.projectId;
     const runId = req.params.runId;
-    const { status, features_core: fc, features_extended: fe, rule_id: ruleId } = req.body || {};
+    const parsed = runPatchSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { status, features_core: fc, features_extended: fe, rule_id: ruleId } = parsed.data || {};
     const { data: current, error: fetchErr } = await supabase.from('runs').select('*').eq('id', runId).eq('project_id', projectId).single();
     if (fetchErr || !current) return res.status(404).json({ error: 'Run not found' });
     const updates = { updated_at: new Date().toISOString() };
@@ -894,7 +959,7 @@ app.patch('/api/projects/:projectId/runs/:runId', async (req, res) => {
     const { data, error } = await supabase.from('runs').update(updates).eq('id', runId).eq('project_id', projectId).select().single();
     if (error) throw error;
     if (updates.status !== undefined) appendRunTrace(runId, current.status, data.status, ruleId || null);
-    auditLog(projectId, ctx.user.id, ctx.user.username, 'update', 'run', data.id);
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'update', 'run', data.id, null, req.requestId);
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -920,23 +985,24 @@ app.get('/api/projects/:projectId/files', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    const { data, error } = await supabase.from('project_files').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false });
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('project_files').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) {
       const msg = String(error.message || error);
       if (msg.includes('does not exist') || msg.includes('relation') || msg.includes('project_files')) {
         console.warn('project_files table missing – run full supabase_schema.sql to enable files. Returning empty list.');
-        return res.json({ files: [] });
+        return res.json({ files: [], limit, offset });
       }
       throw error;
     }
-    res.json({ files: data || [] });
+    res.json({ files: data || [], limit, offset });
   } catch (e) {
     console.error('GET /api/projects/:projectId/files', e?.message || e);
     res.status(500).json({ error: e?.message || 'Failed to list project files' });
   }
 });
 
-app.post('/api/projects/:projectId/files', upload.single('file'), async (req, res) => {
+app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'), async (req, res) => {
   const projectId = req.params.projectId;
   const ctx = await requireProjectMember(req, res, projectId);
   if (!ctx) return;
@@ -966,7 +1032,7 @@ app.post('/api/projects/:projectId/files', upload.single('file'), async (req, re
       original_name: originalName
     }).select().single();
     if (error) throw error;
-    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', data.id, { original_name: originalName });
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', data.id, { original_name: originalName }, req.requestId);
     res.status(201).json(data);
   } catch (e) {
     const status = e.response?.status || 500;
@@ -981,7 +1047,7 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
     if (!ctx) return;
     const { error } = await supabase.from('project_files').delete().eq('id', req.params.fileId).eq('project_id', req.params.projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', req.params.fileId);
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', req.params.fileId, null, req.requestId);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
