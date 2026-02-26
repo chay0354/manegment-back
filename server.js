@@ -701,9 +701,14 @@ app.get('/api/auth/me', (req, res) => {
       res.status(r.status).json(data);
     })
     .catch(e => {
-      const status = e.response?.status || 500;
-      const data = e.response?.data || { error: e.message };
-      res.status(status).json(typeof data === 'object' ? data : { error: e.message });
+      const upstreamStatus = e.response?.status;
+      const upstreamData = e.response?.data;
+      const message = (typeof upstreamData === 'object' && upstreamData?.error) ? upstreamData.error : (e.message || 'Auth service error');
+      if (upstreamStatus >= 500 || !upstreamStatus) {
+        console.error('GET /api/auth/me → Matriya error:', upstreamStatus || e.code || e.message, upstreamData || e.message);
+        return res.status(503).json({ error: 'Auth service unavailable. Check that Matriya backend is running and its database is configured (POSTGRES_URL).', detail: message });
+      }
+      res.status(upstreamStatus || 401).json(typeof upstreamData === 'object' ? upstreamData : { error: message });
     });
 });
 
