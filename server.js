@@ -857,16 +857,20 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
 // ---------- RAG (proxy to Matriya back) ----------
 function ragConnectionErrorMessage(e) {
   const code = e.code || '';
+  const status = e.response?.status;
   if (code === 'ECONNRESET') return 'החיבור למטריה נותק. ייתכן שהבקשה לוקחת יותר מדי זמן או שמטריה התאתחלה. נסה שוב.';
   if (code === 'ETIMEDOUT') return 'הבקשה למטריה עברה timeout. נסה שוב או קצר את השאלה.';
   if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') return 'לא ניתן להתחבר למטריה. וודא שמטריה פועלת ו־MATRIYA_BACK_URL נכון.';
+  if (status === 502 || status === 503 || status === 504) return 'מטריה לא זמינה כרגע (שגיאת שרת). וודא ש־matriya-back פועל והמסד נתונים מוגדר. נסה שוב.';
   return e.response?.data?.error || e.message;
 }
 function ragConnectionStatus(e) {
   const code = e.code || '';
   if (code === 'ECONNRESET' || code === 'ETIMEDOUT') return 502;
   if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') return 503;
-  return e.response?.status || 500;
+  const status = e.response?.status;
+  if (status === 502 || status === 503 || status === 504) return status;
+  return status || 500;
 }
 
 app.get('/api/rag/health', async (req, res) => {
