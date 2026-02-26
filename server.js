@@ -422,7 +422,7 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     if (status !== undefined) {
       const { data: current } = await supabase.from('tasks').select('status').eq('id', req.params.taskId).eq('project_id', req.params.projectId).single();
       if (current && !isAllowedTaskStatusTransition(current.status, status)) {
-        return res.status(400).json({ error: `Invalid status transition: ${current.status} → ${status}` });
+        return res.status(409).json({ error: `Invalid status transition: ${current.status} → ${status}`, invalid_transition: true, from: current.status, to: status });
       }
     }
     const { title, priority, due_date } = req.body || {};
@@ -433,7 +433,8 @@ app.patch('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     if (due_date !== undefined) updates.due_date = due_date || null;
     const { data, error } = await supabase.from('tasks').update(updates).eq('id', req.params.taskId).eq('project_id', req.params.projectId).select().single();
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'task', data.id, { status: data.status });
+    const details = status !== undefined ? { before: { status: current?.status }, after: { status: data.status } } : {};
+    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'update', 'task', data.id, Object.keys(details).length ? details : { title: data.title });
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -780,6 +781,139 @@ function isAllowedTaskStatusTransition(fromStatus, toStatus) {
   const allowed = TASK_STATUS_TRANSITIONS[fromStatus];
   return Array.isArray(allowed) && allowed.includes(toStatus);
 }
+
+// ---------- Runs: controlled vocabulary (feature tagging + status) ----------
+const RUN_STATUSES = ['draft', 'running', 'completed', 'failed'];
+const RUN_FEATURES_CORE = ['research', 'analysis', 'export', 'report', 'doe', 'integrity'];
+const RUN_FEATURES_EXTENDED = ['tagged', 'reviewed', 'archived', 'priority'];
+
+function validateRunFeatures(core = [], extended = []) {
+  const coreArr = Array.isArray(core) ? core : [];
+  const extArr = Array.isArray(extended) ? extended : [];
+  const invalidCore = coreArr.filter(t => !RUN_FEATURES_CORE.includes(t));
+  const invalidExt = extArr.filter(t => !RUN_FEATURES_EXTENDED.includes(t));
+  if (invalidCore.length || invalidExt.length) {
+    return { ok: false, error: `Invalid features: core [${invalidCore.join(', ')}], extended [${invalidExt.join(', ')}]. Allowed core: ${RUN_FEATURES_CORE.join(', ')}; extended: ${RUN_FEATURES_EXTENDED.join(', ')}.` };
+  }
+  return { ok: true, core: coreArr, extended: extArr };
+}
+
+function appendRunTrace(runId, fromState, toState, ruleId = null) {
+  supabase.from('run_fsm_trace').insert({
+    run_id: runId,
+    from_state: fromState,
+    to_state: toState,
+    rule_id: ruleId || null
+  }).then(() => {}).catch(() => {});
+}
+
+// ---------- Runs (per project): feature tagging + FSM trace ----------
+app.get('/api/projects/:projectId/runs', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    let q = supabase.from('runs').select('*').eq('project_id', projectId);
+    const featuresParam = req.query.features;
+    if (featuresParam && typeof featuresParam === 'string') {
+      const tags = featuresParam.split(',').map(s => s.trim()).filter(Boolean);
+      if (tags.length) {
+        const orClauses = tags.flatMap(t => [`features_core.cs.{"${t}"}`, `features_extended.cs.{"${t}"}`]);
+        q = q.or(orClauses.join(','));
+      }
+    }
+    const { data, error } = await q.order('created_at', { ascending: false });
+    if (error) {
+      if (String(error.message || '').includes('relation') || String(error.message || '').includes('does not exist')) {
+        return res.json({ runs: [] });
+      }
+      throw error;
+    }
+    res.json({ runs: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/runs', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const { features_core: fc, features_extended: fe, status } = req.body || {};
+    const validStatus = status && RUN_STATUSES.includes(status) ? status : 'draft';
+    const validation = validateRunFeatures(fc, fe);
+    if (!validation.ok) return res.status(400).json({ error: validation.error });
+    const { data, error } = await supabase.from('runs').insert({
+      project_id: projectId,
+      status: validStatus,
+      features_core: validation.core,
+      features_extended: validation.extended
+    }).select().single();
+    if (error) throw error;
+    appendRunTrace(data.id, null, data.status, null);
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'run', data.id);
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/runs/:runId', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { data, error } = await supabase.from('runs').select('*').eq('id', req.params.runId).eq('project_id', req.params.projectId).single();
+    if (error || !data) return res.status(404).json({ error: 'Run not found' });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/projects/:projectId/runs/:runId', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const runId = req.params.runId;
+    const { status, features_core: fc, features_extended: fe, rule_id: ruleId } = req.body || {};
+    const { data: current, error: fetchErr } = await supabase.from('runs').select('*').eq('id', runId).eq('project_id', projectId).single();
+    if (fetchErr || !current) return res.status(404).json({ error: 'Run not found' });
+    const updates = { updated_at: new Date().toISOString() };
+    if (status !== undefined) {
+      if (!RUN_STATUSES.includes(status)) return res.status(400).json({ error: `Invalid status. Allowed: ${RUN_STATUSES.join(', ')}` });
+      updates.status = status;
+    }
+    if (fc !== undefined || fe !== undefined) {
+      const validation = validateRunFeatures(fc !== undefined ? fc : current.features_core, fe !== undefined ? fe : current.features_extended);
+      if (!validation.ok) return res.status(400).json({ error: validation.error });
+      if (fc !== undefined) updates.features_core = validation.core;
+      if (fe !== undefined) updates.features_extended = validation.extended;
+    }
+    const { data, error } = await supabase.from('runs').update(updates).eq('id', runId).eq('project_id', projectId).select().single();
+    if (error) throw error;
+    if (updates.status !== undefined) appendRunTrace(runId, current.status, data.status, ruleId || null);
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'update', 'run', data.id);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/runs/:runId/trace', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { data: run } = await supabase.from('runs').select('id').eq('id', req.params.runId).eq('project_id', req.params.projectId).single();
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    const { data, error } = await supabase.from('run_fsm_trace').select('id, from_state, to_state, rule_id, created_at').eq('run_id', req.params.runId).order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json({ trace: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ---------- Project files (upload → Matriya ingest, metadata in Supabase) ----------
 app.get('/api/projects/:projectId/files', async (req, res) => {

@@ -129,6 +129,30 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS audit_log_project_id_idx ON audit_log(project_id);
 CREATE INDEX IF NOT EXISTS audit_log_created_at_idx ON audit_log(created_at);
 
+-- Runs (per project): feature tagging + FSM trace
+CREATE TABLE IF NOT EXISTS runs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'running', 'completed', 'failed')),
+  features_core TEXT[] DEFAULT '{}',
+  features_extended TEXT[] DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS runs_project_id_idx ON runs(project_id);
+CREATE INDEX IF NOT EXISTS runs_status_idx ON runs(project_id, status);
+
+-- FSM transition trace per run (from → to, timestamp, ruleId optional)
+CREATE TABLE IF NOT EXISTS run_fsm_trace (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  rule_id TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS run_fsm_trace_run_id_idx ON run_fsm_trace(run_id);
+
 -- Optional: enable RLS and add policies in Supabase Dashboard if you use anon key from frontend.
 --
 -- If tasks table already existed with old status constraint, run to add 'in_review':

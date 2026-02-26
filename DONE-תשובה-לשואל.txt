@@ -1,0 +1,118 @@
+================================================================================
+DONE – רשימה מסודרת לסימון (מערכת הניהול – Management System)
+תשובה לשאלה – מוכן לשליחה לשואל
+================================================================================
+
+--------------------------------------------------------------------------------
+1. PR / Commit links (קישורים או איפה למצוא)
+--------------------------------------------------------------------------------
+
+כל השינויים במערכת הניהול (maneger). ניתן לסמן DONE לפי commits או PR שמאחד אותם:
+
+  נושא                    | Repo              | איפה לחפש
+  ------------------------|-------------------|------------------------------------------
+  Multi-file upload       | manegment-front   | App.jsx: multiple + לולאה Array.from(fileList);
+                          |                   | strings.js: chooseFileMultiple, uploadSomeFailed
+  RBAC                    | manegment-back    | server.js: requireProjectMember, 401/403
+  Audit log + before/after| manegment-back    | server.js: auditLog(); task update details
+  FSM (409)               | manegment-back    | server.js: PATCH task → 409 invalid_transition
+  Runs + trace            | manegment-back    | server.js: runs, run_fsm_trace; supabase_schema
+  ENFORCEMENT + script    | manegment-back    | ENFORCEMENT.md, scripts/check-enforcement.js
+
+אם יש PR אחד שמכסה הכול:
+  • manegment-back: PR עם RBAC, Audit, FSM 409, Runs, ENFORCEMENT.md, check-enforcement.js
+  • manegment-front: PR עם Multi-file upload (App.jsx + strings)
+
+
+--------------------------------------------------------------------------------
+2. טבלת Endpoints → Guards (Auth / Admin / Permission)
+--------------------------------------------------------------------------------
+
+  Endpoint                              | Guard
+  -------------------------------------|------------------------------------------
+  GET  /api/projects                   | אין
+  POST /api/projects                   | Auth (401 אם לא מאומת)
+  GET  /api/projects/:id               | Auth + Project member (403 אם לא חבר)
+  PATCH /api/projects/:id              | Auth + Owner only
+  DELETE /api/projects/:id             | Auth + Owner only
+  GET  .../requests, POST approve/reject | Auth + Owner only (רשימת בקשות + אישור/דחייה)
+  GET  .../members                    | Auth + Project member
+  POST / DELETE .../members            | Auth + Owner only
+  GET/POST .../chat                    | Auth + Project member
+  GET/POST/PATCH/DELETE .../tasks      | Auth + Project member (PATCH: גם FSM → 409)
+  GET/POST/PATCH/DELETE .../milestones | Auth + Project member
+  GET/POST/PATCH/DELETE .../documents  | Auth + Project member
+  GET/POST/PATCH/DELETE .../notes      | Auth + Project member
+  GET/POST/DELETE .../files            | Auth + Project member
+  GET/POST/PATCH .../runs, .../trace   | Auth + Project member
+  GET /api/auth/me, POST login/signup  | – (proxy ל-Matriya)
+  GET/POST .../rag/*                   | Auth (מועבר ל-Matriya)
+
+  Auth = כותרת Authorization: Bearer <token>; בלי → 401.
+  Project member = requireProjectMember; לא חבר → 403.
+  Owner only = role === 'owner'; אחרת → 403.
+  Admin = אין במערכת הניהול; רק owner / member.
+
+
+--------------------------------------------------------------------------------
+3. שתי דוגמאות cURL
+--------------------------------------------------------------------------------
+
+(א) דוגמה שמקבלת 403 או 409 (כישלון):
+
+  • 401 – בלי token:
+    curl -X GET "http://localhost:8001/api/projects/<PROJECT_ID>/tasks"
+    (בלי Authorization → 401)
+
+  • 403 – token של משתמש שלא בפרויקט:
+    curl -X GET "http://localhost:8001/api/projects/<PROJECT_ID>/tasks" \
+      -H "Authorization: Bearer <TOKEN_של_משתמש_לא_בפרויקט>"
+    תשובה: 403, {"error":"Not a project member"}
+
+  • 409 – מעבר FSM לא חוקי (todo → done):
+    curl -X PATCH "http://localhost:8001/api/projects/<PROJECT_ID>/tasks/<TASK_ID>" \
+      -H "Authorization: Bearer <VALID_TOKEN>" \
+      -H "Content-Type: application/json" \
+      -d '{"status":"done"}'
+    כשהמשימה ב-todo: 409, {"error":"Invalid status transition: todo → done","invalid_transition":true,"from":"todo","to":"done"}
+
+
+(ב) דוגמה שמצליחה 200:
+
+  • רשימת משימות (משתמש חבר בפרויקט):
+    curl -X GET "http://localhost:8001/api/projects/<PROJECT_ID>/tasks" \
+      -H "Authorization: Bearer <VALID_TOKEN>"
+    תשובה: 200, {"tasks":[...]}
+
+  • עדכון משימה מעבר חוקי (todo → in_progress):
+    curl -X PATCH "http://localhost:8001/api/projects/<PROJECT_ID>/tasks/<TASK_ID>" \
+      -H "Authorization: Bearer <VALID_TOKEN>" \
+      -H "Content-Type: application/json" \
+      -d '{"status":"in_progress"}'
+    תשובה: 200 + אובייקט המשימה
+
+
+--------------------------------------------------------------------------------
+4. דוגמת רשומת Audit מלאה (before/after + user_id + timestamp)
+--------------------------------------------------------------------------------
+
+טבלה: audit_log (ב-Supabase). שדה details (JSONB) מכיל before/after בעדכוני task.
+
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "project_id": "ec9e94e5-f981-41dc-8595-dbc14f2dd117",
+  "user_id": 42,
+  "username": "david",
+  "action": "update",
+  "entity_type": "task",
+  "entity_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "details": {
+    "before": { "status": "todo" },
+    "after":  { "status": "in_progress" }
+  },
+  "created_at": "2026-02-25T14:30:00.000Z"
+}
+
+================================================================================
+סוף המסמך
+================================================================================
