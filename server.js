@@ -17,6 +17,9 @@ const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const MATRIYA_BACK_URL = (process.env.MATRIYA_BACK_URL || '').replace(/\/$/, '');
+const SHAREPOINT_TENANT_ID = process.env.SHAREPOINT_TENANT_ID || '';
+const SHAREPOINT_CLIENT_ID = process.env.SHAREPOINT_CLIENT_ID || '';
+const SHAREPOINT_CLIENT_SECRET = process.env.SHAREPOINT_CLIENT_SECRET || '';
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
@@ -38,6 +41,7 @@ app.use((req, res, next) => {
 // Rate limiting: auth strict, upload/chat/rag moderate, general API relaxed
 const limiterAuth = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Too many auth attempts' } });
 const limiterUpload = rateLimit({ windowMs: 60 * 1000, max: 15, message: { error: 'Too many uploads' } });
+const limiterSharePoint = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many SharePoint pull requests' } });
 const limiterRag = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Too many RAG requests' } });
 const limiterGeneral = rateLimit({ windowMs: 60 * 1000, max: 200, message: { error: 'Too many requests' } });
 app.use('/api/auth', limiterAuth);
@@ -63,9 +67,10 @@ app.get('/', (req, res) => res.json({ service: 'maneger-back', health: '/health'
 app.get('/api/projects', async (req, res) => {
   try {
     const { limit, offset } = parsePagination(req);
+    const { count } = await supabase.from('projects').select('*', { count: 'exact', head: true });
     const { data, error } = await supabase.from('projects').select('*').order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ projects: data || [], limit, offset });
+    res.json({ projects: data || [], limit, offset, total: count ?? 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -413,9 +418,10 @@ app.get('/api/projects/:projectId/tasks', async (req, res) => {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
     const { limit, offset } = parsePagination(req);
+    const { count } = await supabase.from('tasks').select('*', { count: 'exact', head: true }).eq('project_id', req.params.projectId);
     const { data, error } = await supabase.from('tasks').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ tasks: data || [], limit, offset });
+    res.json({ tasks: data || [], limit, offset, total: count ?? 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -481,6 +487,19 @@ app.delete('/api/projects/:projectId/tasks/:taskId', async (req, res) => {
     if (error) throw error;
     auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'task', req.params.taskId, null, req.requestId);
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/audit', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
+    const { data, error } = await supabase.from('audit_log').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(0, limit - 1);
+    if (error) throw error;
+    res.json({ audit: data || [] });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -980,6 +999,46 @@ app.get('/api/projects/:projectId/runs/:runId/trace', async (req, res) => {
   }
 });
 
+// ---------- SharePoint (Microsoft Graph) – optional ----------
+const sharepointPullSchema = z.object({
+  siteUrl: z.string().url().optional(),
+  siteId: z.string().uuid().optional(),
+  folderPath: z.string().max(2000).default(''),
+  driveId: z.string().uuid().optional(),
+  mock: z.boolean().optional()
+}).refine(data => data.mock === true || data.siteUrl != null || data.siteId != null, { message: 'Either siteUrl, siteId, or mock: true is required' });
+
+let graphTokenCache = { token: null, expiresAt: 0 };
+async function getGraphToken() {
+  if (graphTokenCache.token && Date.now() < graphTokenCache.expiresAt - 60000) return graphTokenCache.token;
+  const res = await axios.post(
+    `https://login.microsoftonline.com/${SHAREPOINT_TENANT_ID}/oauth2/v2.0/token`,
+    new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: SHAREPOINT_CLIENT_ID,
+      client_secret: SHAREPOINT_CLIENT_SECRET,
+      scope: 'https://graph.microsoft.com/.default'
+    }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+  );
+  const accessToken = res.data?.access_token;
+  const expiresIn = (res.data?.expires_in || 3600) * 1000;
+  if (!accessToken) throw new Error('No access_token in Graph response');
+  graphTokenCache = { token: accessToken, expiresAt: Date.now() + expiresIn };
+  return accessToken;
+}
+
+async function getSiteIdFromUrl(siteUrl, token) {
+  const u = new URL(siteUrl);
+  const hostname = u.hostname;
+  const pathname = u.pathname.replace(/\/$/, '') || '/';
+  const res = await axios.get(
+    `https://graph.microsoft.com/v1.0/sites/${hostname}:${pathname}`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 }
+  );
+  return res.data?.id;
+}
+
 // ---------- Project files (upload → Matriya ingest, metadata in Supabase) ----------
 app.get('/api/projects/:projectId/files', async (req, res) => {
   try {
@@ -999,6 +1058,80 @@ app.get('/api/projects/:projectId/files', async (req, res) => {
   } catch (e) {
     console.error('GET /api/projects/:projectId/files', e?.message || e);
     res.status(500).json({ error: e?.message || 'Failed to list project files' });
+  }
+});
+
+app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, async (req, res) => {
+  const projectId = req.params.projectId;
+  const ctx = await requireProjectMember(req, res, projectId);
+  if (!ctx) return;
+  if (!SHAREPOINT_TENANT_ID || !SHAREPOINT_CLIENT_ID || !SHAREPOINT_CLIENT_SECRET) {
+    return res.status(503).json({ error: 'SharePoint integration not configured (SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET)' });
+  }
+  if (!MATRIYA_BACK_URL) {
+    return res.status(503).json({ error: 'MATRIYA_BACK_URL not set – cannot ingest files' });
+  }
+  const parsed = sharepointPullSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+  }
+  const { siteUrl, siteId, folderPath, driveId } = parsed.data;
+  try {
+    const token = await getGraphToken();
+    let site = siteId;
+    if (!site && siteUrl) site = await getSiteIdFromUrl(siteUrl, token);
+    if (!site) return res.status(400).json({ error: 'Could not resolve SharePoint site (check siteUrl or siteId)' });
+    const drivePath = driveId
+      ? `https://graph.microsoft.com/v1.0/sites/${site}/drives/${driveId}`
+      : `https://graph.microsoft.com/v1.0/sites/${site}/drive`;
+    const folderPathEnc = folderPath.replace(/^\//, '').trim();
+    const listUrl = folderPathEnc
+      ? `${drivePath}/root:/${folderPathEnc}:/children`
+      : `${drivePath}/root/children`;
+    const listRes = await axios.get(listUrl, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+    const children = listRes.data?.value || [];
+    const files = children.filter(item => item.file != null);
+    const ingested = [];
+    const failed = [];
+    for (const item of files) {
+      try {
+        const contentRes = await axios.get(
+          `https://graph.microsoft.com/v1.0/sites/${site}/drive/items/${item.id}/content`,
+          { headers: { Authorization: `Bearer ${token}` }, responseType: 'arraybuffer', timeout: 120000, maxRedirects: 5 }
+        );
+        const buffer = Buffer.from(contentRes.data);
+        const originalName = item.name || 'file';
+        const form = new FormData();
+        form.append('file', buffer, { filename: originalName });
+        const ingestRes = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
+          timeout: 120000,
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
+          headers: form.getHeaders()
+        });
+        if (!ingestRes.data?.success) {
+          failed.push({ name: originalName, error: ingestRes.data?.error || 'Ingestion failed' });
+          continue;
+        }
+        const { data: row, error } = await supabase.from('project_files').insert({
+          project_id: projectId,
+          original_name: originalName
+        }).select().single();
+        if (error) {
+          failed.push({ name: originalName, error: error.message });
+          continue;
+        }
+        auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName, source: 'sharepoint' }, req.requestId);
+        ingested.push({ id: row.id, original_name: originalName });
+      } catch (e) {
+        failed.push({ name: item.name || 'file', error: e.response?.data?.error ?? e.message });
+      }
+    }
+    res.json({ pulled: ingested.length, failed: failed.length, ingested, failed });
+  } catch (e) {
+    const msg = e.response?.data?.error?.message ?? e.response?.data?.error ?? e.message;
+    const status = e.response?.status || 500;
+    res.status(status).json({ error: msg });
   }
 });
 

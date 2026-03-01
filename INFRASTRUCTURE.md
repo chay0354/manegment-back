@@ -90,6 +90,34 @@
 
 ---
 
+## 6. SharePoint – משיכת קבצים מפולדר (אופציונלי)
+
+ניתן למשוך קבצים מתיקיית SharePoint לפרויקט (לאחר מכן הם נשלחים ל-Matriya ingest כמו העלאה רגילה).
+
+**Endpoint:** `POST /api/projects/:projectId/files/pull-sharepoint`  
+**Rate limit:** 5 בקשות לדקה (`limiterSharePoint`).
+
+**Body (JSON):**
+
+- `siteUrl` (string, אופציונלי) – כתובת האתר, למשל `https://tenant.sharepoint.com/sites/MySite`
+- `siteId` (UUID, אופציונלי) – מזהה האתר ב-Graph (אם ידוע)
+- `folderPath` (string, חובה) – נתיב התיקייה בתוך ה-drive, למשל `Shared Documents/MyFolder` או ריק ל-root
+- `driveId` (UUID, אופציונלי) – מזהה ה-drive; ברירת מחדל: ה-drive הראשי של האתר
+
+חובה לספק `siteUrl` או `siteId`.
+
+**משתני סביבה (אופציונליים):**
+
+- `SHAREPOINT_TENANT_ID` – Tenant (ספריית Azure AD)
+- `SHAREPOINT_CLIENT_ID` – Client ID של App registration
+- `SHAREPOINT_CLIENT_SECRET` – Client secret של האפליקציה
+
+ב-Azure: App registration → API permissions → Microsoft Graph → Application: `Sites.Read.All` או `Files.Read.All` (לפחות).
+
+**תשובה:** `{ pulled, failed, ingested: [{ id, original_name }], failed: [{ name, error }] }`.
+
+---
+
 ## סיכום: מה כבר קיים vs מה דורש השלמה
 
 | פריט | קיים | הושלם במסגרת זו |
