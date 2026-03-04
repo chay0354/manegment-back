@@ -1076,7 +1076,13 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
     return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
   }
   const { siteUrl, siteId, folderPath, driveId } = parsed.data;
+  const requestId = (req.body && req.body.request_id) || req.requestId;
   try {
+    const { data: existing, error: insertError } = await supabase.from('sharepoint_pull_requests').insert({ request_id: requestId, project_id: projectId }).select('request_id').single();
+    if (insertError && insertError.code === '23505') {
+      return res.json({ pulled: 0, skipped: true, idempotent: true, message: 'Already processed this request_id' });
+    }
+    if (insertError) throw insertError;
     const token = await getGraphToken();
     let site = siteId;
     if (!site && siteUrl) site = await getSiteIdFromUrl(siteUrl, token);
@@ -1271,7 +1277,21 @@ app.post('/api/rag/research/session', async (req, res) => {
 });
 
 // ---------- Health ----------
-app.get('/health', (req, res) => res.json({ ok: true, service: 'maneger-back' }));
+app.get('/health', async (req, res) => {
+  const start = Date.now();
+  let db_status = 'disconnected';
+  try {
+    const { error } = await supabase.from('projects').select('id').limit(1);
+    db_status = error ? 'disconnected' : 'connected';
+  } catch (_) {}
+  const response_time_ms = Date.now() - start;
+  res.json({
+    ok: db_status === 'connected',
+    service: 'maneger-back',
+    db_status,
+    response_time_ms
+  });
+});
 
 // Vercel uses this as the serverless handler; locally we start the HTTP server
 if (!process.env.VERCEL) {

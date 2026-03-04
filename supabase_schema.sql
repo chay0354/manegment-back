@@ -72,6 +72,13 @@ CREATE TABLE IF NOT EXISTS project_files (
 
 CREATE INDEX IF NOT EXISTS project_files_project_id_idx ON project_files(project_id);
 
+-- SharePoint pull idempotency: one row per request_id (ON CONFLICT DO NOTHING)
+CREATE TABLE IF NOT EXISTS sharepoint_pull_requests (
+  request_id TEXT PRIMARY KEY,
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
 -- User cache (Matriya user_id -> username for "add member" lookup)
 CREATE TABLE IF NOT EXISTS user_cache (
   user_id INTEGER PRIMARY KEY,
