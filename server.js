@@ -1236,13 +1236,16 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
     if (bucketListCache.data && Date.now() < bucketListCache.expiresAt) {
-      return res.json({ files: bucketListCache.data });
+      const cached = bucketListCache.data;
+      const files = Array.isArray(cached) ? cached : cached.files;
+      const displayNamesMap = Array.isArray(cached) ? {} : (cached.displayNamesMap || {});
+      return res.json({ files, displayNamesMap });
     }
     const [files, mapping] = await Promise.all([listBucketRecursive(''), getBucketNameMapping()]);
     const withDisplay = files.map(f => ({ ...f, displayName: mapping[f.path] || f.name }));
-    bucketListCache.data = withDisplay;
+    bucketListCache.data = { files: withDisplay, displayNamesMap: mapping };
     bucketListCache.expiresAt = Date.now() + BUCKET_CACHE_TTL_MS;
-    res.json({ files: withDisplay });
+    res.json({ files: withDisplay, displayNamesMap: mapping });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'Failed to list bucket' });
   }

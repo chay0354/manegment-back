@@ -39,9 +39,17 @@ function safeStorageKey(relativePath) {
 async function main() {
   const mapping = {};
   for (const { relativePath } of walkFiles(folderPath)) {
+    const normalized = relativePath.replace(/\\/g, '/');
     const safePath = safeStorageKey(relativePath);
-    const originalName = relativePath.replace(/\\/g, '/').split('/').pop() || relativePath;
+    const originalParts = normalized.split('/').filter(Boolean);
+    const safeParts = safePath.split('/').filter(Boolean);
+    const originalName = originalParts[originalParts.length - 1] || relativePath;
     mapping[safePath] = originalName;
+    for (let i = 0; i < safeParts.length - 1; i++) {
+      const safePrefix = safeParts.slice(0, i + 1).join('/');
+      const originalFolderName = originalParts[i] || safePrefix;
+      if (!mapping[safePrefix]) mapping[safePrefix] = originalFolderName;
+    }
   }
   const json = JSON.stringify(mapping, null, 0);
   const { error } = await supabase.storage.from(bucketName).upload('_mapping.json', Buffer.from(json, 'utf8'), { contentType: 'application/json', upsert: true });
