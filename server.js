@@ -1005,6 +1005,196 @@ app.get('/api/projects/:projectId/runs/:runId/trace', async (req, res) => {
   }
 });
 
+// ---------- Import & lab data (management only) ----------
+const EXPERIMENT_OUTCOMES = ['success', 'failure', 'partial', 'production_formula'];
+
+function validateExperimentForSync(exp) {
+  const err = [];
+  if (exp.technology_domain == null || String(exp.technology_domain).trim() === '') err.push('technology_domain required');
+  if (exp.experiment_outcome == null || !EXPERIMENT_OUTCOMES.includes(exp.experiment_outcome)) err.push('experiment_outcome must be one of: ' + EXPERIMENT_OUTCOMES.join(', '));
+  if (exp.is_production_formula == null) err.push('is_production_formula required');
+  if (exp.materials == null) err.push('materials required (use [] if none)');
+  if (exp.percentages == null) err.push('percentages required (use {} if none)');
+  return err;
+}
+
+app.get('/api/projects/:projectId/import/log', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('import_log').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ entries: data || [], limit, offset });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/import/sharepoint-file', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const body = req.body || {};
+    const source_file_reference = body.source_file_reference != null ? String(body.source_file_reference).trim() : null;
+    const experiments = Array.isArray(body.experiments) ? body.experiments : [];
+    if (!source_file_reference) return res.status(400).json({ error: 'source_file_reference is required' });
+    let created = 0, updated = 0, errCount = 0;
+    const details = { errors: [] };
+    for (const exp of experiments) {
+      const eid = exp.experiment_id != null ? String(exp.experiment_id) : null;
+      if (!eid) { errCount++; details.errors.push({ item: exp, reason: 'experiment_id required' }); continue; }
+      const payload = {
+        project_id: projectId,
+        experiment_id: eid,
+        experiment_version: exp.experiment_version != null ? parseInt(exp.experiment_version, 10) : 1,
+        technology_domain: exp.technology_domain != null ? String(exp.technology_domain) : '',
+        formula: exp.formula != null ? String(exp.formula) : null,
+        materials: exp.materials != null ? exp.materials : [],
+        percentages: exp.percentages != null ? exp.percentages : {},
+        results: exp.results != null ? (typeof exp.results === 'string' ? exp.results : JSON.stringify(exp.results)) : null,
+        experiment_outcome: exp.experiment_outcome && EXPERIMENT_OUTCOMES.includes(exp.experiment_outcome) ? exp.experiment_outcome : 'success',
+        is_production_formula: !!exp.is_production_formula,
+        source_file_reference,
+        research_session_id: exp.research_session_id || null,
+        updated_at: new Date().toISOString()
+      };
+      const { data: existing } = await supabase.from('lab_experiments').select('id, experiment_version').eq('project_id', projectId).eq('experiment_id', eid).single();
+      if (existing) {
+        payload.experiment_version = Math.max((payload.experiment_version || 1), (existing.experiment_version || 0) + 1);
+        const { error: upErr } = await supabase.from('lab_experiments').update(payload).eq('project_id', projectId).eq('experiment_id', eid);
+        if (upErr) { errCount++; details.errors.push({ experiment_id: eid, reason: upErr.message }); continue; }
+        updated++;
+      } else {
+        const { error: insErr } = await supabase.from('lab_experiments').insert(payload);
+        if (insErr) { errCount++; details.errors.push({ experiment_id: eid, reason: insErr.message }); continue; }
+        created++;
+      }
+    }
+    const { error: logErr } = await supabase.from('import_log').insert({
+      project_id: projectId,
+      source_file_reference,
+      source_type: 'sharepoint_file',
+      created_count: created,
+      updated_count: updated,
+      error_count: errCount,
+      details: details.errors.length ? details : null
+    });
+    if (logErr) console.warn('import_log insert failed:', logErr.message);
+    res.status(201).json({ created, updated, error_count: errCount, source_file_reference, details: errCount ? details : undefined });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/experiments', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { limit, offset } = parsePagination(req);
+    const { data, error } = await supabase.from('lab_experiments').select('*').eq('project_id', req.params.projectId).order('updated_at', { ascending: false }).range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ experiments: data || [], limit, offset });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/experiments/sync-to-matriya', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+    const { data: rows, error } = await supabase.from('lab_experiments').select('*').eq('project_id', projectId);
+    if (error) throw error;
+    const experiments = (rows || []).map(r => ({
+      experiment_id: r.experiment_id,
+      technology_domain: r.technology_domain,
+      formula: r.formula,
+      materials: r.materials,
+      percentages: r.percentages,
+      results: r.results,
+      experiment_outcome: r.experiment_outcome,
+      is_production_formula: r.is_production_formula
+    }));
+    const validationErrors = [];
+    for (let i = 0; i < experiments.length; i++) {
+      const errs = validateExperimentForSync(experiments[i]);
+      if (errs.length) validationErrors.push({ index: i, experiment_id: experiments[i].experiment_id, errors: errs });
+    }
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ error: 'Sync validation failed: required fields missing', validation_errors: validationErrors });
+    }
+    const r = await axios.post(`${MATRIYA_BACK_URL}/sync/experiments`, { experiments }, { timeout: 30000 });
+    res.json(r.data);
+  } catch (e) {
+    const status = e.response?.status || 500;
+    const data = e.response?.data;
+    res.status(status).json(data || { error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/research-sessions', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { data, error } = await supabase.from('research_sessions').select('*').eq('project_id', req.params.projectId).order('started_at', { ascending: false });
+    if (error) throw error;
+    res.json({ sessions: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/research-sessions', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { name } = req.body || {};
+    const { data, error } = await supabase.from('research_sessions').insert({
+      project_id: req.params.projectId,
+      name: name != null ? String(name).trim() || null : null
+    }).select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/material-library', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { data, error } = await supabase.from('material_library').select('*').eq('project_id', req.params.projectId).order('name');
+    if (error) throw error;
+    res.json({ materials: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/material-library', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { name, role_or_function } = req.body || {};
+    const nameStr = name != null ? String(name).trim() : null;
+    if (!nameStr) return res.status(400).json({ error: 'name is required' });
+    const { data, error } = await supabase.from('material_library').upsert({
+      project_id: req.params.projectId,
+      name: nameStr,
+      role_or_function: role_or_function != null ? String(role_or_function).trim() || null : null
+    }, { onConflict: 'project_id,name' }).select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- SharePoint (Microsoft Graph) – optional ----------
 const sharepointPullSchema = z.object({
   siteUrl: z.string().url().optional(),
