@@ -1392,6 +1392,17 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
 const SHAREPOINT_BUCKET = 'sharepoint-files';
 const MAPPING_KEY = '_mapping.json';
 
+function safeStorageKeySegment(name) {
+  return String(name).replace(/[^\x00-\x7E.a-zA-Z0-9_.-]/g, '_').replace(/\s+/g, '_').replace(/[()[\]]/g, '_') || 'file';
+}
+function safeStoragePath(relativePathOrName, folderPath) {
+  const prefix = (folderPath && String(folderPath).trim()) ? String(folderPath).replace(/\\/g, '/').split('/').filter(Boolean).map(safeStorageKeySegment).join('/') : '';
+  const parts = String(relativePathOrName).replace(/\\/g, '/').split('/').filter(Boolean);
+  const safeParts = parts.map(p => safeStorageKeySegment(p) || 'file');
+  const relativeKey = safeParts.join('/') || 'file';
+  return prefix ? `${prefix}/${relativeKey}` : relativeKey;
+}
+
 const bucketListCache = { data: null, expiresAt: 0 };
 const BUCKET_CACHE_TTL_MS = 2 * 60 * 1000;
 
@@ -1438,6 +1449,30 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     res.json({ files: withDisplay, displayNamesMap: mapping });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'Failed to list bucket' });
+  }
+});
+
+app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUpload, upload.array('files', 50), async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const files = req.files || [];
+    if (files.length === 0) return res.status(400).json({ error: 'No files provided. Send multipart form with "files" (and optional "folderPath").' });
+    const folderPath = (req.body && req.body.folderPath != null) ? String(req.body.folderPath).trim() : '';
+    const uploaded = [];
+    const failed = [];
+    for (const file of files) {
+      const relativeName = file.originalname || file.name || 'file';
+      const storagePath = safeStoragePath(relativeName, folderPath);
+      const { error } = await supabase.storage.from(SHAREPOINT_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype || 'application/octet-stream', upsert: true });
+      if (error) failed.push({ name: relativeName, error: error.message });
+      else uploaded.push({ path: storagePath, name: relativeName });
+    }
+    bucketListCache.data = null;
+    bucketListCache.expiresAt = 0;
+    res.status(201).json({ uploaded: uploaded.length, failed: failed.length, uploaded_paths: uploaded, errors: failed.length ? failed : undefined });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
