@@ -1926,6 +1926,7 @@ function safeStoragePath(relativePathOrName, folderPath) {
 
 const bucketListCache = { byProject: {}, files: null, filesExpiresAt: 0 };
 const BUCKET_CACHE_TTL_MS = 2 * 60 * 1000;
+const BUCKET_DISPLAY_NAMES_CACHE_TTL_MS = 30 * 1000; // shorter so production shows decoded names soon after upload
 
 const PROJECT_PREFIX = 'project_';
 
@@ -2019,6 +2020,7 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     if (!ctx) return;
     const projectId = req.params.projectId;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0'); // so production always gets fresh display names (no קובץ/תיקייה)
     const now = Date.now();
     let files = (bucketListCache.files && now < bucketListCache.filesExpiresAt) ? bucketListCache.files : null;
     if (!files) {
@@ -2032,10 +2034,12 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
       return res.json({ files: withDisplay, displayNamesMap: projCache.displayNamesMap });
     }
     const prefix = `${PROJECT_PREFIX}${projectId}/`;
-    const [mapping, { data: dbRows }] = await Promise.all([
+    const [mapping, { data: dbRowsRaw, error: dbErr }] = await Promise.all([
       getBucketNameMapping(),
       supabase.from('sharepoint_display_names').select('path, display_name').eq('project_id', projectId)
     ]);
+    if (dbErr && process.env.NODE_ENV !== 'production') console.warn('[sharepoint-bucket] display_names query failed (table missing?):', dbErr.message);
+    const dbRows = dbRowsRaw || [];
     const dbMap = {};
     for (const row of dbRows || []) {
       if (row.path != null && row.display_name != null) dbMap[prefix + row.path] = row.display_name;
@@ -2055,7 +2059,7 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
       return d;
     };
     const withDisplay = files.map(f => ({ ...f, displayName: safeDisplay(f.path, f.name) }));
-    bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_CACHE_TTL_MS };
+    bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_DISPLAY_NAMES_CACHE_TTL_MS };
     res.json({ files: withDisplay, displayNamesMap });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'Failed to list bucket' });
