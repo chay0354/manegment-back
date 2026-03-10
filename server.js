@@ -2038,7 +2038,7 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
       getBucketNameMapping(),
       supabase.from('sharepoint_display_names').select('path, display_name').eq('project_id', projectId)
     ]);
-    if (dbErr && process.env.NODE_ENV !== 'production') console.warn('[sharepoint-bucket] display_names query failed (table missing?):', dbErr.message);
+    if (dbErr) console.warn('[sharepoint-bucket] display_names query failed (run migration 005?):', dbErr.message);
     const dbRows = dbRowsRaw || [];
     const dbMap = {};
     for (const row of dbRows || []) {
@@ -2059,7 +2059,9 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
       return d;
     };
     const withDisplay = files.map(f => ({ ...f, displayName: safeDisplay(f.path, f.name) }));
-    bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_DISPLAY_NAMES_CACHE_TTL_MS };
+    if (dbRows.length > 0) {
+      bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_DISPLAY_NAMES_CACHE_TTL_MS };
+    }
     res.json({ files: withDisplay, displayNamesMap });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'Failed to list bucket' });
