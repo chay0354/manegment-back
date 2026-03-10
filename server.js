@@ -12,6 +12,7 @@ import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 import FormData from 'form-data';
 import { z } from 'zod';
+import * as XLSX from 'xlsx';
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -50,7 +51,7 @@ app.use(limiterGeneral);
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }
+  limits: { fileSize: 200 * 1024 * 1024 } // 200MB per file
 });
 
 // Pagination: ?limit=50&offset=0 (limit 1–100, default 50)
@@ -778,7 +779,8 @@ async function getCurrentUser(req) {
     if (r.data && r.data.id != null) return r.data;
   } catch (e) {
     if (process.env.NODE_ENV !== 'production') {
-      console.warn('getCurrentUser failed:', e.code || e.response?.status || e.message);
+      const code = e.code || e.response?.status || e.message;
+      console.warn('getCurrentUser failed:', code, '| URL:', `${MATRIYA_BACK_URL}/auth/me`, '| Is Matriya back running? Check MATRIYA_BACK_URL in .env');
     }
   }
   return null;
@@ -1005,6 +1007,63 @@ app.get('/api/projects/:projectId/runs/:runId/trace', async (req, res) => {
   }
 });
 
+// ---------- Central materials & technology domains (reference for analysis) ----------
+const SUGGESTED_TECHNOLOGY_DOMAINS = ['acrylic_coating', 'mineral_coating', 'intumescent', 'concrete_inhibitor', 'concrete_repair', 'sealer', 'stone_consolidator'];
+
+async function requireAuth(req, res) {
+  if (!MATRIYA_BACK_URL) {
+    res.status(503).json({ error: 'Auth not configured' });
+    return null;
+  }
+  const user = await getCurrentUser(req);
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required' });
+    return null;
+  }
+  return user;
+}
+
+app.get('/api/materials', async (req, res) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const { data, error } = await supabase.from('materials').select('*').order('material_name');
+    if (error) {
+      if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
+        return res.json({ materials: [] });
+      }
+      throw error;
+    }
+    res.json({ materials: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/materials', async (req, res) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const { material_id, material_name, aliases, material_family, material_role, technology_domain } = req.body || {};
+    const idStr = material_id != null ? String(material_id).trim() : null;
+    const nameStr = material_name != null ? String(material_name).trim() : null;
+    if (!idStr || !nameStr) return res.status(400).json({ error: 'material_id and material_name are required' });
+    const row = {
+      material_id: idStr,
+      material_name: nameStr,
+      aliases: Array.isArray(aliases) ? aliases : (aliases != null ? [String(aliases)] : []),
+      material_family: material_family != null ? String(material_family).trim() || null : null,
+      material_role: material_role != null ? String(material_role).trim() || null : null,
+      technology_domain: technology_domain != null ? String(technology_domain).trim() || null : null
+    };
+    const { data, error } = await supabase.from('materials').upsert(row, { onConflict: 'material_id' }).select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Import & lab data (management only) ----------
 const EXPERIMENT_OUTCOMES = ['success', 'failure', 'partial', 'production_formula'];
 
@@ -1076,6 +1135,96 @@ app.post('/api/projects/:projectId/import/sharepoint-file', async (req, res) => 
       project_id: projectId,
       source_file_reference,
       source_type: 'sharepoint_file',
+      created_count: created,
+      updated_count: updated,
+      error_count: errCount,
+      details: details.errors.length ? details : null
+    });
+    if (logErr) console.warn('import_log insert failed:', logErr.message);
+    res.status(201).json({ created, updated, error_count: errCount, source_file_reference, details: errCount ? details : undefined });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/import/experiment-excel', limiterUpload, upload.single('file'), async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded. Send multipart form with field "file".' });
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const firstSheet = wb.SheetNames[0];
+    if (!firstSheet) return res.status(400).json({ error: 'Excel file has no sheets' });
+    const ws = wb.Sheets[firstSheet];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
+    if (!rows.length) return res.status(201).json({ created: 0, updated: 0, error_count: 0, source_file_reference: req.file.originalname || 'excel' });
+
+    const col = (obj, ...keys) => {
+      for (const k of keys) {
+        const v = obj[k];
+        if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+        const lower = k.toLowerCase();
+        for (const key of Object.keys(obj)) {
+          if (key.toLowerCase() === lower) return obj[key];
+        }
+      }
+      return null;
+    };
+
+    const source_file_reference = req.file.originalname || 'experiment-excel';
+    let created = 0, updated = 0, errCount = 0;
+    const details = { errors: [] };
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const eid = col(row, 'experiment_id', 'experiment id', 'id');
+      if (!eid) { errCount++; details.errors.push({ row: i + 2, reason: 'experiment_id required' }); continue; }
+      let materials = col(row, 'materials', 'material');
+      let percentages = col(row, 'percentages', 'percentage');
+      if (typeof materials === 'string') {
+        try { materials = JSON.parse(materials); } catch (_) { materials = materials.split(/[,;]/).map(s => s.trim()).filter(Boolean); }
+      }
+      if (!Array.isArray(materials) && typeof materials !== 'object') materials = [];
+      if (typeof percentages === 'string') {
+        try { percentages = JSON.parse(percentages); } catch (_) { percentages = {}; }
+      }
+      if (typeof percentages !== 'object' || percentages === null) percentages = {};
+      const outcomeRaw = (col(row, 'experiment_outcome', 'outcome', 'result') || 'success').toString().toLowerCase();
+      const experiment_outcome = EXPERIMENT_OUTCOMES.includes(outcomeRaw) ? outcomeRaw : (outcomeRaw.includes('fail') ? 'failure' : outcomeRaw.includes('part') ? 'partial' : 'success');
+
+      const payload = {
+        project_id: projectId,
+        experiment_id: String(eid),
+        experiment_version: 1,
+        technology_domain: (col(row, 'technology_domain', 'domain', 'technology domain') || 'unknown').toString().trim(),
+        formula: col(row, 'formula', 'formulation') != null ? String(col(row, 'formula', 'formulation')).trim() : null,
+        materials,
+        percentages,
+        results: col(row, 'results', 'result') != null ? String(col(row, 'results', 'result')).trim() : null,
+        experiment_outcome,
+        is_production_formula: /true|1|yes|כן/.test(String(col(row, 'is_production_formula', 'production') || '')),
+        source_file_reference,
+        updated_at: new Date().toISOString()
+      };
+
+      const { data: existing } = await supabase.from('lab_experiments').select('id, experiment_version').eq('project_id', projectId).eq('experiment_id', payload.experiment_id).single();
+      if (existing) {
+        payload.experiment_version = (existing.experiment_version || 0) + 1;
+        const { error: upErr } = await supabase.from('lab_experiments').update(payload).eq('project_id', projectId).eq('experiment_id', payload.experiment_id);
+        if (upErr) { errCount++; details.errors.push({ row: i + 2, experiment_id: payload.experiment_id, reason: upErr.message }); continue; }
+        updated++;
+      } else {
+        const { error: insErr } = await supabase.from('lab_experiments').insert(payload);
+        if (insErr) { errCount++; details.errors.push({ row: i + 2, experiment_id: payload.experiment_id, reason: insErr.message }); continue; }
+        created++;
+      }
+    }
+
+    const { error: logErr } = await supabase.from('import_log').insert({
+      project_id: projectId,
+      source_file_reference,
+      source_type: 'experiment_excel',
       created_count: created,
       updated_count: updated,
       error_count: errCount,
@@ -1190,6 +1339,362 @@ app.post('/api/projects/:projectId/material-library', async (req, res) => {
     }, { onConflict: 'project_id,name' }).select().single();
     if (error) throw error;
     res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Lab analysis: contradictions, failure patterns, snapshot, formula validate, relations, insights, guard ----------
+async function getExperimentsForAnalysis(projectId, options = {}) {
+  let q = supabase.from('lab_experiments').select('*').eq('project_id', projectId);
+  if (options.researchSessionId) q = q.eq('research_session_id', options.researchSessionId);
+  if (options.since) q = q.gte('updated_at', options.since);
+  const { data, error } = await q.order('updated_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+function normalizeFormulaForCompare(formula) {
+  if (formula == null) return '';
+  return String(formula).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+app.get('/api/projects/:projectId/analysis/contradictions', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId);
+    const byNormalized = new Map();
+    for (const exp of experiments) {
+      const key = normalizeFormulaForCompare(exp.formula) || exp.experiment_id;
+      if (!byNormalized.has(key)) byNormalized.set(key, []);
+      byNormalized.get(key).push(exp);
+    }
+    const contradictions = [];
+    for (const [key, list] of byNormalized) {
+      if (list.length < 2) continue;
+      const outcomes = [...new Set(list.map(e => e.experiment_outcome))];
+      if (outcomes.length > 1) {
+        contradictions.push({ formula_key: key, experiments: list.map(e => ({ id: e.id, experiment_id: e.experiment_id, experiment_outcome: e.experiment_outcome, formula: e.formula })), outcomes });
+      }
+    }
+    res.json({ contradictions });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/failure-patterns', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId);
+    const failures = experiments.filter(e => e.experiment_outcome === 'failure' || e.experiment_outcome === 'partial');
+    const byDomain = {};
+    const byMaterial = {};
+    for (const e of failures) {
+      const d = e.technology_domain || 'unknown';
+      byDomain[d] = (byDomain[d] || 0) + 1;
+      const mats = Array.isArray(e.materials) ? e.materials : (e.materials && typeof e.materials === 'object' ? Object.keys(e.materials) : []);
+      mats.forEach(m => { const n = typeof m === 'string' ? m : (m?.name || String(m)); byMaterial[n] = (byMaterial[n] || 0) + 1; });
+    }
+    const domainEntries = Object.entries(byDomain).sort((a, b) => b[1] - a[1]).slice(0, 20);
+    const materialEntries = Object.entries(byMaterial).sort((a, b) => b[1] - a[1]).slice(0, 20);
+    res.json({ failure_count: failures.length, by_domain: domainEntries, by_material: materialEntries, sample_failures: failures.slice(0, 10) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/research-snapshot', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const sessionId = req.query.research_session_id;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId, sessionId ? { researchSessionId: sessionId } : {});
+    const outcomes = { success: 0, failure: 0, partial: 0, production_formula: 0 };
+    experiments.forEach(e => { if (outcomes[e.experiment_outcome] !== undefined) outcomes[e.experiment_outcome]++; });
+    const domains = {};
+    experiments.forEach(e => { const d = e.technology_domain || 'unknown'; domains[d] = (domains[d] || 0) + 1; });
+    res.json({
+      total: experiments.length,
+      outcomes,
+      by_domain: Object.entries(domains).sort((a, b) => b[1] - a[1]),
+      snapshot_at: new Date().toISOString(),
+      research_session_id: sessionId || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/analysis/formula-validate', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { formula, domain, materials, percentages } = req.body || {};
+    const errors = [];
+    const warnings = [];
+    if (formula != null && String(formula).trim().length === 0) warnings.push('Formula is empty');
+    if (percentages && typeof percentages === 'object') {
+      const vals = Object.values(percentages).map(v => parseFloat(v));
+      const sum = vals.reduce((a, b) => a + b, 0);
+      if (vals.length && (isNaN(sum) || Math.abs(sum - 100) > 0.01)) warnings.push(`Percentages sum to ${sum.toFixed(1)}; expected 100`);
+    }
+    let similar = [];
+    if (MATRIYA_BACK_URL && (formula || materials || domain)) {
+      try {
+        const r = await axios.post(`${MATRIYA_BACK_URL}/analysis/formula`, { domain: domain || '', materials: materials || [], percentages: percentages || {} }, { timeout: 10000 });
+        if (r.data?.similar_experiments) similar = r.data.similar_experiments;
+        if (Array.isArray(r.data?.warnings)) r.data.warnings.forEach(w => warnings.push(w));
+      } catch (_) { /* Matriya optional */ }
+    }
+    res.json({ valid: errors.length === 0, errors, warnings, similar_experiments: similar });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/relations', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId);
+    const relations = [];
+    for (const exp of experiments) {
+      relations.push({ type: 'experiment_formula', experiment_id: exp.experiment_id, formula: exp.formula || null });
+      const mats = Array.isArray(exp.materials) ? exp.materials : (exp.materials && typeof exp.materials === 'object' ? Object.keys(exp.materials) : []);
+      mats.forEach(m => relations.push({ type: 'experiment_material', experiment_id: exp.experiment_id, material: typeof m === 'string' ? m : (m?.name || String(m)) }));
+      if (exp.results) relations.push({ type: 'experiment_result', experiment_id: exp.experiment_id, result_preview: String(exp.results).slice(0, 200) });
+    }
+    const { data: materials } = await supabase.from('material_library').select('name').eq('project_id', req.params.projectId);
+    const materialNames = new Set((materials || []).map(m => m.name));
+    res.json({ relations, experiments_count: experiments.length, material_library_count: materialNames.size, material_library: [...materialNames] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/insights', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId);
+    const total = experiments.length;
+    const success = experiments.filter(e => e.experiment_outcome === 'success').length;
+    const failure = experiments.filter(e => e.experiment_outcome === 'failure').length;
+    const partial = experiments.filter(e => e.experiment_outcome === 'partial').length;
+    const production = experiments.filter(e => e.experiment_outcome === 'production_formula' || e.is_production_formula).length;
+    const byDomain = {};
+    experiments.forEach(e => { const d = e.technology_domain || 'unknown'; byDomain[d] = byDomain[d] || { total: 0, success: 0, failure: 0 }; byDomain[d].total++; if (e.experiment_outcome === 'success') byDomain[d].success++; else if (e.experiment_outcome === 'failure' || e.experiment_outcome === 'partial') byDomain[d].failure++; });
+    const domainStats = Object.entries(byDomain).map(([name, s]) => ({ domain: name, ...s, success_rate: s.total ? Math.round((s.success / s.total) * 100) : 0 }));
+    domainStats.sort((a, b) => b.total - a.total);
+    res.json({
+      total_experiments: total,
+      success_count: success,
+      failure_count: failure,
+      partial_count: partial,
+      production_formula_count: production,
+      success_rate_pct: total ? Math.round((success / total) * 100) : 0,
+      by_domain: domainStats.slice(0, 15)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/guard/check', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { formula, experiment_id, materials, action } = req.body || {};
+    const warnings = [];
+    const normalized = normalizeFormulaForCompare(formula);
+    if (normalized) {
+      const experiments = await getExperimentsForAnalysis(req.params.projectId);
+      const sameFormula = experiments.filter(e => normalizeFormulaForCompare(e.formula) === normalized && e.experiment_id !== experiment_id);
+      if (sameFormula.length > 0) warnings.push({ code: 'duplicate_formula', message: 'Same or very similar formula already exists in project', count: sameFormula.length, experiment_ids: sameFormula.map(e => e.experiment_id) });
+    }
+    res.json({ allowed: true, warnings });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function logAnalysis(projectId, analysisType, inputRef, result, requestId) {
+  try {
+    await supabase.from('analysis_log').insert({
+      project_id: projectId,
+      analysis_type: analysisType,
+      input_ref: inputRef || null,
+      result: result || {},
+      request_id: requestId || null
+    });
+  } catch (_) { /* table may not exist yet */ }
+}
+
+function getMaterialsSet(exp) {
+  const mats = Array.isArray(exp.materials) ? exp.materials : (exp.materials && typeof exp.materials === 'object' ? Object.keys(exp.materials) : []);
+  return new Set(mats.map(m => (typeof m === 'string' ? m : (m?.name || String(m))).trim().toLowerCase()).filter(Boolean));
+}
+
+function getPercentagesMap(exp) {
+  const p = exp.percentages;
+  if (!p || typeof p !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(p)) {
+    const num = parseFloat(v);
+    if (!isNaN(num)) out[String(k).trim().toLowerCase()] = num;
+  }
+  return out;
+}
+
+function similarityScore(expA, expB) {
+  const matA = getMaterialsSet(expA);
+  const matB = getMaterialsSet(expB);
+  const inter = [...matA].filter(m => matB.has(m)).length;
+  const union = new Set([...matA, ...matB]).size;
+  const jaccard = union ? inter / union : 0;
+  const percA = getPercentagesMap(expA);
+  const percB = getPercentagesMap(expB);
+  const allKeys = new Set([...Object.keys(percA), ...Object.keys(percB)]);
+  let sumDiff = 0;
+  let count = 0;
+  allKeys.forEach(k => {
+    const a = percA[k] ?? 0;
+    const b = percB[k] ?? 0;
+    sumDiff += Math.abs(a - b);
+    count++;
+  });
+  const avgDiff = count ? sumDiff / count : 0;
+  const percScore = Math.max(0, 1 - avgDiff / 100);
+  return jaccard * 0.5 + percScore * 0.5;
+}
+
+app.post('/api/projects/:projectId/analysis/formulation-intelligence', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const { formula, domain, materials, percentages } = req.body || {};
+    const issues = [];
+    let status = 'OK';
+
+    const vals = percentages && typeof percentages === 'object' ? Object.values(percentages).map(v => parseFloat(v)) : [];
+    const sum = vals.reduce((a, b) => a + b, 0);
+    if (vals.length > 0) {
+      if (isNaN(sum) || Math.abs(sum - 100) > 0.5) {
+        issues.push({ code: 'mass_balance', severity: 'error', message: `סכום אחוזים ${sum.toFixed(1)}%; מצופה 100%` });
+        status = 'Risk';
+      }
+    }
+
+    if (percentages && typeof percentages === 'object') {
+      for (const [name, v] of Object.entries(percentages)) {
+        const num = parseFloat(v);
+        if (!isNaN(num) && (num < 0 || num > 100)) {
+          issues.push({ code: 'range', severity: 'warning', message: `אחוז לחומר "${name}" מחוץ לטווח 0–100: ${num}` });
+          if (status === 'OK') status = 'Warning';
+        }
+      }
+    }
+
+    const matList = Array.isArray(materials) ? materials : (materials && typeof materials === 'object' ? Object.keys(materials) : []);
+    matList.forEach(m => {
+      const name = typeof m === 'string' ? m : (m?.name ?? String(m));
+      if (!name || !String(name).trim()) {
+        issues.push({ code: 'empty_material', severity: 'warning', message: 'חומר ללא שם' });
+        if (status === 'OK') status = 'Warning';
+      }
+    });
+
+    const experiments = await getExperimentsForAnalysis(projectId);
+    const normalized = normalizeFormulaForCompare(formula);
+    const sameFormula = experiments.filter(e => normalizeFormulaForCompare(e.formula) === normalized);
+    const failedSame = sameFormula.filter(e => e.experiment_outcome === 'failure' || e.experiment_outcome === 'partial');
+    if (failedSame.length > 0) {
+      issues.push({ code: 'similar_failed', severity: 'risk', message: `פורמולציה דומה כבר נכשלה ב־${failedSame.length} ניסויים`, experiment_ids: failedSame.map(e => e.experiment_id) });
+      status = 'Risk';
+    }
+
+    const failures = experiments.filter(e => e.experiment_outcome === 'failure' || e.experiment_outcome === 'partial');
+    const failureMaterials = new Set();
+    failures.forEach(e => getMaterialsSet(e).forEach(m => failureMaterials.add(m)));
+    const inputMats = new Set((matList.map(m => (typeof m === 'string' ? m : (m?.name ?? String(m))).trim().toLowerCase())).filter(Boolean));
+    const overlap = [...inputMats].filter(m => failureMaterials.has(m));
+    if (overlap.length > 0 && failures.length >= 2) {
+      issues.push({ code: 'materials_in_failed', severity: 'warning', message: `חומרים שמופיעים בניסויים שנכשלו: ${overlap.join(', ')}`, materials: overlap });
+      if (status === 'OK') status = 'Warning';
+    }
+
+    try {
+      const { data: centralList } = await supabase.from('materials').select('material_id, material_name, aliases');
+      if (centralList && centralList.length > 0) {
+        const known = new Set();
+        centralList.forEach(r => {
+          known.add((r.material_name || '').toString().trim().toLowerCase());
+          known.add((r.material_id || '').toString().trim().toLowerCase());
+          (r.aliases || []).forEach(a => known.add(String(a).trim().toLowerCase()));
+        });
+        const unknown = [...inputMats].filter(m => !known.has(m));
+        if (unknown.length > 0) {
+          issues.push({ code: 'material_not_in_library', severity: 'warning', message: `חומרים שלא בספרייה המרכזית: ${unknown.join(', ')}`, materials: unknown });
+          if (status === 'OK') status = 'Warning';
+        }
+      }
+    } catch (_) { /* materials table may not exist */ }
+
+    const result = { status, issues };
+    await logAnalysis(projectId, 'formulation_intelligence', null, result, req.requestId);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/similar-experiments', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const experimentIdParam = req.query.experiment_id;
+    if (!experimentIdParam) return res.status(400).json({ error: 'experiment_id query is required' });
+
+    const experiments = await getExperimentsForAnalysis(projectId);
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(experimentIdParam);
+    const source = experiments.find(e => isUuid ? e.id === experimentIdParam : e.experiment_id === experimentIdParam);
+    if (!source) return res.status(404).json({ error: 'Experiment not found' });
+
+    const withScore = experiments
+      .filter(e => e.id !== source.id && e.experiment_id !== source.experiment_id)
+      .map(e => ({ experiment: e, score: similarityScore(source, e) }))
+      .filter(x => x.score > 0.1)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20)
+      .map(({ experiment, score }) => ({
+        experiment_id: experiment.experiment_id,
+        id: experiment.id,
+        technology_domain: experiment.technology_domain,
+        experiment_outcome: experiment.experiment_outcome,
+        formula: experiment.formula ? String(experiment.formula).slice(0, 150) : null,
+        similarity_score: Math.round(score * 100) / 100
+      }));
+
+    const result = { source_experiment_id: source.experiment_id, similar: withScore };
+    await logAnalysis(projectId, 'similar_experiments', source.experiment_id, result, req.requestId);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/analysis/technology-domains', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const experiments = await getExperimentsForAnalysis(req.params.projectId);
+    const fromData = [...new Set(experiments.map(e => (e.technology_domain || '').trim()).filter(Boolean))].sort();
+    res.json({ suggested: SUGGESTED_TECHNOLOGY_DOMAINS, from_data: fromData });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1390,7 +1895,23 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
 });
 
 const SHAREPOINT_BUCKET = 'sharepoint-files';
+const MANUAL_BUCKET = 'manually-uploaded-sharepoint-files';
+const MANUAL_PREFIX = 'manual';
 const MAPPING_KEY = '_mapping.json';
+
+async function ensureSharepointBucketExists() {
+  const { error } = await supabase.storage.createBucket(SHAREPOINT_BUCKET, { public: false });
+  if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
+    console.warn('[SharePoint] bucket create:', error.message);
+  }
+}
+
+async function ensureManualBucketExists() {
+  const { error } = await supabase.storage.createBucket(MANUAL_BUCKET, { public: false });
+  if (error && !String(error.message || '').toLowerCase().includes('already exists')) {
+    console.warn('[SharePoint] manual bucket create:', error.message);
+  }
+}
 
 function safeStorageKeySegment(name) {
   return String(name).replace(/[^\x00-\x7E.a-zA-Z0-9_.-]/g, '_').replace(/\s+/g, '_').replace(/[()[\]]/g, '_') || 'file';
@@ -1403,8 +1924,46 @@ function safeStoragePath(relativePathOrName, folderPath) {
   return prefix ? `${prefix}/${relativeKey}` : relativeKey;
 }
 
-const bucketListCache = { data: null, expiresAt: 0 };
+const bucketListCache = { byProject: {}, files: null, filesExpiresAt: 0 };
 const BUCKET_CACHE_TTL_MS = 2 * 60 * 1000;
+
+const PROJECT_PREFIX = 'project_';
+
+async function getNextFolderNumber(projectId, forManualBucket = false) {
+  const query = forManualBucket
+    ? supabase.from('sharepoint_display_names').select('path')
+    : supabase.from('sharepoint_display_names').select('path').eq('project_id', projectId);
+  const { data: rows } = await query;
+  const folderPaths = (rows || []).filter(r => r.path && /^folder_\d+$/.test(String(r.path).trim()));
+  if (folderPaths.length === 0) return 1;
+  const nums = folderPaths.map(r => parseInt(String(r.path).replace(/^folder_(\d+)$/, '$1'), 10)).filter(n => !Number.isNaN(n));
+  return nums.length ? Math.max(...nums) + 1 : 1;
+}
+
+function getExtension(relativeName) {
+  const s = String(relativeName || '');
+  const i = s.lastIndexOf('.');
+  return i > 0 ? s.slice(i) : '';
+}
+
+/** Returns ASCII-only extension for Supabase storage (Hebrew not supported in bucket paths). */
+function getExtensionAscii(relativeName) {
+  const raw = getExtension(relativeName);
+  if (!raw) return '';
+  const safe = raw.replace(/[^a-zA-Z0-9.]/g, '').toLowerCase().slice(0, 10);
+  return safe ? (safe.startsWith('.') ? safe : '.' + safe) : '';
+}
+
+/** Random ASCII id for bucket paths (no folder_1 / file_1; Hebrew not supported in Supabase Storage). */
+function randomAsciiId(len = 8) {
+  return crypto.randomBytes(Math.ceil(len / 2)).toString('hex').slice(0, len);
+}
+
+/** True if path is our ASCII-only manual bucket path (e.g. "a1b2c3d4.pdf" or "a1b2c3/x4y5z6.pdf"). */
+function isManualAsciiPath(path) {
+  const s = typeof path === 'string' ? path.trim() : '';
+  return s.length > 0 && /^[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)?(\/[a-zA-Z0-9._-]+)?$/.test(s);
+}
 
 async function getBucketNameMapping() {
   const { data, error } = await supabase.storage.from(SHAREPOINT_BUCKET).download(MAPPING_KEY);
@@ -1415,40 +1974,211 @@ async function getBucketNameMapping() {
   } catch { return {}; }
 }
 
-async function listBucketRecursive(prefix = '') {
-  const { data, error } = await supabase.storage.from(SHAREPOINT_BUCKET).list(prefix, { limit: 500 });
+async function saveBucketNameMapping(mapping) {
+  const json = JSON.stringify(mapping || {}, null, 0);
+  const { error } = await supabase.storage.from(SHAREPOINT_BUCKET).upload(MAPPING_KEY, Buffer.from(json, 'utf8'), { contentType: 'application/json', upsert: true });
+  if (error) throw error;
+}
+
+async function listBucketRecursive(bucket, prefix = '') {
+  const { data, error } = await supabase.storage.from(bucket).list(prefix, { limit: 500 });
   if (error) throw error;
   const files = [];
   const subdirs = [];
   for (const item of data || []) {
     const path = prefix ? `${prefix}/${item.name}` : item.name;
-    if (item.id != null) files.push({ path, name: item.name });
+    if (item.id) files.push({ path, name: item.name });
     else subdirs.push(path);
   }
   if (subdirs.length) {
-    const nested = await Promise.all(subdirs.map(p => listBucketRecursive(p)));
-    nested.forEach(arr => files.push(...arr));
+    const nested = await Promise.all(subdirs.map(p => listBucketRecursive(bucket, p)));
+    nested.forEach((arr, idx) => {
+      files.push(...arr);
+      if (arr.length === 0) {
+        const p = subdirs[idx];
+        const name = p.includes('/') ? p.split('/').pop() : p;
+        files.push({ path: p, name: name || p });
+      }
+    });
   }
   return files;
+}
+
+async function listAllBucketsMerged() {
+  const [fromSharepoint, fromManual] = await Promise.all([
+    listBucketRecursive(SHAREPOINT_BUCKET, ''),
+    listBucketRecursive(MANUAL_BUCKET, '').catch(() => [])
+  ]);
+  const manualPrefixed = fromManual.map(f => ({ path: MANUAL_PREFIX + '/' + f.path, name: f.name }));
+  return [...fromSharepoint, ...manualPrefixed];
 }
 
 app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
-    if (bucketListCache.data && Date.now() < bucketListCache.expiresAt) {
-      const cached = bucketListCache.data;
-      const files = Array.isArray(cached) ? cached : cached.files;
-      const displayNamesMap = Array.isArray(cached) ? {} : (cached.displayNamesMap || {});
-      return res.json({ files, displayNamesMap });
+    const projectId = req.params.projectId;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    const now = Date.now();
+    let files = (bucketListCache.files && now < bucketListCache.filesExpiresAt) ? bucketListCache.files : null;
+    if (!files) {
+      files = await listAllBucketsMerged();
+      bucketListCache.files = files;
+      bucketListCache.filesExpiresAt = now + BUCKET_CACHE_TTL_MS;
     }
-    const [files, mapping] = await Promise.all([listBucketRecursive(''), getBucketNameMapping()]);
-    const withDisplay = files.map(f => ({ ...f, displayName: mapping[f.path] || f.name }));
-    bucketListCache.data = { files: withDisplay, displayNamesMap: mapping };
-    bucketListCache.expiresAt = Date.now() + BUCKET_CACHE_TTL_MS;
-    res.json({ files: withDisplay, displayNamesMap: mapping });
+    const projCache = bucketListCache.byProject[projectId];
+    if (projCache && now < projCache.expiresAt) {
+      const withDisplay = files.map(f => ({ ...f, displayName: projCache.safeDisplay(f.path, f.name) }));
+      return res.json({ files: withDisplay, displayNamesMap: projCache.displayNamesMap });
+    }
+    const prefix = `${PROJECT_PREFIX}${projectId}/`;
+    const [mapping, { data: dbRows }] = await Promise.all([
+      getBucketNameMapping(),
+      supabase.from('sharepoint_display_names').select('path, display_name').eq('project_id', projectId)
+    ]);
+    const dbMap = {};
+    for (const row of dbRows || []) {
+      if (row.path != null && row.display_name != null) dbMap[prefix + row.path] = row.display_name;
+    }
+    const displayNamesMap = { ...mapping };
+    for (const k of Object.keys(dbMap)) {
+      displayNamesMap[k] = dbMap[k];
+      displayNamesMap[MANUAL_PREFIX + '/' + k] = dbMap[k];
+    }
+    for (const row of dbRows || []) {
+      if (row.path != null && row.display_name != null) displayNamesMap[MANUAL_PREFIX + '/' + row.path] = row.display_name;
+    }
+    const safeDisplay = (path, name) => {
+      const d = displayNamesMap[path] ?? mapping[path];
+      if (d == null || d === '' || d === '_') return name || path;
+      if (/[\uFFFD\u00A4]/.test(String(d))) return name || path;
+      return d;
+    };
+    const withDisplay = files.map(f => ({ ...f, displayName: safeDisplay(f.path, f.name) }));
+    bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_CACHE_TTL_MS };
+    res.json({ files: withDisplay, displayNamesMap });
   } catch (e) {
     res.status(500).json({ error: e?.message || 'Failed to list bucket' });
+  }
+});
+
+// Get signed upload URLs for direct-to-bucket upload from frontend (faster, no file through server).
+// Storage paths are ASCII-only (random ids) because Hebrew is not supported in Supabase Storage; display names (Hebrew/English) are stored in DB and shown in the frontend.
+app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/signed-urls', limiterUpload, async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const folderPath = (req.body?.folderPath != null) ? String(req.body.folderPath).trim() : '';
+    const files = req.body?.files;
+    if (!Array.isArray(files) || files.length === 0) return res.status(400).json({ error: 'Body must include files: [{ relativeName, contentType? }]' });
+    if (files.length > 50) return res.status(400).json({ error: 'Maximum 50 files per request' });
+
+    const folderId = folderPath ? randomAsciiId(8) : null;
+    const storagePaths = files.map((f) => {
+      const relativeName = (f && f.relativeName) ? String(f.relativeName) : 'file';
+      const ext = getExtensionAscii(relativeName) || '';
+      const fileId = randomAsciiId(8);
+      return folderId ? `${folderId}/${fileId}${ext}` : `${fileId}${ext}`;
+    });
+
+    const urls = [];
+    await ensureManualBucketExists();
+    for (const storagePath of storagePaths) {
+      const { data, error } = await supabase.storage.from(MANUAL_BUCKET).createSignedUploadUrl(storagePath, { upsert: true });
+      if (error) return res.status(500).json({ error: error.message });
+      urls.push({ path: data.path, token: data.token });
+    }
+    res.json({ bucket: MANUAL_BUCKET, urls });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/invalidate-cache', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    bucketListCache.files = null;
+    bucketListCache.filesExpiresAt = 0;
+    bucketListCache.byProject = {};
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function mergePathDisplayMappings(merged, storagePath, displayName) {
+  const p = String(storagePath).trim();
+  const d = String(displayName).trim();
+  if (!p || d == null) return;
+  merged[p] = d;
+  const pParts = p.split('/');
+  const dParts = d.split('/');
+  for (let i = 0; i < pParts.length; i++) {
+    const prefixP = pParts.slice(0, i + 1).join('/');
+    if (!prefixP) continue;
+    const isFolder = i < pParts.length - 1;
+    if (isFolder) {
+      const folderDisplayIndex = Math.min(i, Math.max(0, dParts.length - 2));
+      merged[prefixP] = dParts[folderDisplayIndex] ?? dParts[0] ?? prefixP;
+    } else {
+      merged[prefixP] = d;
+    }
+  }
+}
+
+app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/update-display-names', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const mappings = req.body?.mappings;
+    if (!mappings || typeof mappings !== 'object') return res.status(400).json({ error: 'Body must include mappings: { "storagePath": "displayName", ... }' });
+
+    const prefix = `${PROJECT_PREFIX}${projectId}/`;
+    if (Object.keys(mappings).length > 0) console.log('[update-display-names] projectId=', projectId, 'prefix=', prefix, 'mappingKeys=', Object.keys(mappings).slice(0, 3));
+    for (const [rawPath, displayName] of Object.entries(mappings)) {
+      const d = String(displayName ?? '').trim();
+      if (!d) continue;
+      const storagePath = String(rawPath ?? '').trim().replace(/^\/+/, '');
+      const relativePath = storagePath.startsWith(prefix)
+        ? storagePath.slice(prefix.length).trim()
+        : (isManualAsciiPath(storagePath) ? storagePath : '');
+      if (!relativePath) {
+        console.log('[update-display-names] skip path (no prefix match):', JSON.stringify(storagePath));
+        continue;
+      }
+      const dParts = d.split('/').filter(Boolean);
+      const relParts = relativePath.split('/').filter(Boolean);
+      const fileDisplayName = dParts.length > 0 ? dParts[dParts.length - 1] : d;
+      const folderDisplayName = dParts.length > 1 ? dParts[0] : dParts[0] || d;
+      const { error: errFile } = await supabase.from('sharepoint_display_names').upsert(
+        { project_id: projectId, path: relativePath, display_name: fileDisplayName, updated_at: new Date().toISOString() },
+        { onConflict: 'project_id,path' }
+      );
+      if (errFile) return res.status(500).json({ error: 'Failed to save display name: ' + (errFile.message || 'database error') });
+      if (relParts.length > 1) {
+        const folderPath = relParts.slice(0, -1).join('/');
+        const { error: errFolder } = await supabase.from('sharepoint_display_names').upsert(
+          { project_id: projectId, path: folderPath, display_name: folderDisplayName, updated_at: new Date().toISOString() },
+          { onConflict: 'project_id,path' }
+        );
+        if (errFolder) return res.status(500).json({ error: 'Failed to save folder display name: ' + (errFolder.message || 'database error') });
+      }
+    }
+
+    const current = await getBucketNameMapping();
+    const merged = { ...current };
+    for (const [path, displayName] of Object.entries(mappings)) {
+      mergePathDisplayMappings(merged, path, displayName);
+    }
+    await saveBucketNameMapping(merged);
+    bucketListCache.files = null;
+    bucketListCache.filesExpiresAt = 0;
+    bucketListCache.byProject = {};
+    res.json({ ok: true, updated: Object.keys(mappings).length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -1456,25 +2186,96 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
+    const projectId = req.params.projectId;
     const files = req.files || [];
     if (files.length === 0) return res.status(400).json({ error: 'No files provided. Send multipart form with "files" (and optional "folderPath").' });
     const folderPath = (req.body && req.body.folderPath != null) ? String(req.body.folderPath).trim() : '';
+    let fileNames = null;
+    try {
+      if (req.body && typeof req.body.fileNamesB64 === 'string') {
+        const decoded = Buffer.from(req.body.fileNamesB64, 'base64').toString('utf8');
+        fileNames = JSON.parse(decoded);
+      }
+    } catch (_) {}
+    if (!Array.isArray(fileNames) || fileNames.length !== files.length) {
+      try {
+        if (req.body && typeof req.body.fileNames === 'string') fileNames = JSON.parse(req.body.fileNames);
+      } catch (_) {}
+    }
+    if (!Array.isArray(fileNames) || fileNames.length !== files.length) fileNames = null;
+    if (!fileNames && files.length > 0 && process.env.NODE_ENV !== 'production') console.warn('[SharePoint upload] fileNames missing or length mismatch – display names may be wrong.');
+    await ensureManualBucketExists();
     const uploaded = [];
     const failed = [];
-    for (const file of files) {
-      const relativeName = file.originalname || file.name || 'file';
-      const storagePath = safeStoragePath(relativeName, folderPath);
-      const { error } = await supabase.storage.from(SHAREPOINT_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype || 'application/octet-stream', upsert: true });
-      if (error) failed.push({ name: relativeName, error: error.message });
-      else uploaded.push({ path: storagePath, name: relativeName });
+    const folderId = folderPath ? randomAsciiId(8) : null;
+    const storagePaths = files.map((file, i) => {
+      const relativeName = fileNames ? String(fileNames[i] ?? '').trim() || file.originalname || file.name || 'file' : file.originalname || file.name || 'file';
+      const ext = getExtensionAscii(relativeName) || '';
+      const fileId = randomAsciiId(8);
+      return folderId ? `${folderId}/${fileId}${ext}` : `${fileId}${ext}`;
+    });
+    if (folderPath) console.log('[SharePoint upload] bucket=', MANUAL_BUCKET, 'folderPath(display)=', folderPath, 'storagePrefix=', folderId, 'supabaseProject=', (SUPABASE_URL || '').replace(/^https:\/\/([^.]+).*/, '$1'));
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const relativeName = fileNames ? String(fileNames[i] ?? '').trim() || file.originalname || file.name || 'file' : file.originalname || file.name || 'file';
+      const storagePath = storagePaths[i];
+      const { data: uploadData, error } = await supabase.storage.from(MANUAL_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype || 'application/octet-stream', upsert: true });
+      if (error) {
+        console.error('[SharePoint upload] FAIL path=', storagePath, 'error=', error.message);
+        failed.push({ name: relativeName, error: error.message });
+      } else {
+        console.log('[SharePoint upload] OK path=', storagePath);
+        uploaded.push({ path: storagePath, name: relativeName });
+      }
     }
-    bucketListCache.data = null;
-    bucketListCache.expiresAt = 0;
-    res.status(201).json({ uploaded: uploaded.length, failed: failed.length, uploaded_paths: uploaded, errors: failed.length ? failed : undefined });
+    if (uploaded.length > 0) {
+      for (const u of uploaded) {
+        const relativePath = u.path.startsWith(PROJECT_PREFIX)
+          ? u.path.slice(`${PROJECT_PREFIX}${projectId}/`.length).trim()
+          : (isManualAsciiPath(u.path) ? u.path : '');
+        if (!relativePath) continue;
+        const relParts = relativePath.split('/').filter(Boolean);
+        const fileDisplayName = folderPath ? (folderPath + '/' + u.name).split('/').filter(Boolean).pop() || u.name : u.name;
+        const folderDisplayName = folderPath || (relParts.length > 1 ? 'Upload' : '');
+        const { error: errFile } = await supabase.from('sharepoint_display_names').upsert(
+          { project_id: projectId, path: relativePath, display_name: fileDisplayName, updated_at: new Date().toISOString() },
+          { onConflict: 'project_id,path' }
+        );
+        if (errFile) console.warn('[SharePoint upload] display_name upsert failed (bucket list will show ASCII path):', relativePath, errFile.message);
+        if (relParts.length > 1) {
+          const folderPathKey = relParts.slice(0, -1).join('/');
+          const { error: errFolder } = await supabase.from('sharepoint_display_names').upsert(
+            { project_id: projectId, path: folderPathKey, display_name: folderDisplayName, updated_at: new Date().toISOString() },
+            { onConflict: 'project_id,path' }
+          );
+          if (errFolder && process.env.NODE_ENV !== 'production') console.warn('[SharePoint upload] folder display_name upsert failed:', folderPathKey, errFolder.message);
+        }
+      }
+    }
+    bucketListCache.files = null;
+    bucketListCache.filesExpiresAt = 0;
+    bucketListCache.byProject = {};
+    const supabaseProjectRef = (SUPABASE_URL || '').match(/https:\/\/([^.]+)\.supabase\.co/)?.[1] || 'unknown';
+    res.status(201).json({
+      uploaded: uploaded.length,
+      failed: failed.length,
+      uploaded_paths: uploaded,
+      errors: failed.length ? failed : undefined,
+      bucket: MANUAL_BUCKET,
+      supabase_project: supabaseProjectRef
+    });
   } catch (e) {
+    console.error('[SharePoint upload] route error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
+
+function resolveBucketAndPath(path) {
+  if (path.startsWith(MANUAL_PREFIX + '/')) {
+    return { bucket: MANUAL_BUCKET, storagePath: path.slice(MANUAL_PREFIX.length + 1) };
+  }
+  return { bucket: SHAREPOINT_BUCKET, storagePath: path };
+}
 
 app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
   try {
@@ -1484,12 +2285,13 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     const path = req.body?.path;
     if (!path || typeof path !== 'string') return res.status(400).json({ error: 'path is required' });
     if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+    const { bucket, storagePath } = resolveBucketAndPath(path);
     let displayName = req.body?.displayName;
     if (!displayName || typeof displayName !== 'string') {
-      const mapping = await getBucketNameMapping();
+      const mapping = bucket === SHAREPOINT_BUCKET ? await getBucketNameMapping() : {};
       displayName = mapping[path] || path.split('/').pop() || path || 'file';
     }
-    const { data: blob, error: downloadError } = await supabase.storage.from(SHAREPOINT_BUCKET).download(path);
+    const { data: blob, error: downloadError } = await supabase.storage.from(bucket).download(storagePath);
     if (downloadError || !blob) return res.status(404).json({ error: downloadError?.message || 'File not found in bucket' });
     const buffer = Buffer.from(await blob.arrayBuffer());
     const originalName = displayName;
@@ -1523,7 +2325,8 @@ app.get('/api/projects/:projectId/files/:fileId/download', async (req, res) => {
     const { data: row, error } = await supabase.from('project_files').select('original_name, storage_path').eq('id', fileId).eq('project_id', projectId).single();
     if (error || !row) return res.status(404).json({ error: 'File not found' });
     if (!row.storage_path) return res.status(404).json({ error: 'Download not available for this file (not from SharePoint bucket)' });
-    const { data: blob, error: downloadError } = await supabase.storage.from(SHAREPOINT_BUCKET).download(row.storage_path);
+    const { bucket, storagePath } = resolveBucketAndPath(row.storage_path);
+    const { data: blob, error: downloadError } = await supabase.storage.from(bucket).download(storagePath);
     if (downloadError || !blob) return res.status(404).json({ error: downloadError?.message || 'File not found in storage' });
     const buffer = Buffer.from(await blob.arrayBuffer());
     const filename = row.original_name || row.storage_path.split('/').pop() || 'download';
