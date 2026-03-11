@@ -2115,10 +2115,11 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/signed-urls
     if (!ctx) return;
     const folderPath = (req.body?.folderPath != null) ? String(req.body.folderPath).trim() : '';
     const files = req.body?.files;
+    const existingFolderId = (req.body?.folderId != null && req.body.folderId !== '') ? String(req.body.folderId).trim() : null;
     if (!Array.isArray(files) || files.length === 0) return res.status(400).json({ error: 'Body must include files: [{ relativeName, contentType? }]' });
     if (files.length > 50) return res.status(400).json({ error: 'Maximum 50 files per request' });
 
-    const folderId = folderPath ? randomAsciiId(8) : null;
+    const folderId = (folderPath && !existingFolderId) ? randomAsciiId(8) : (folderPath ? existingFolderId : null);
     const storagePaths = files.map((f) => {
       const relativeName = (f && f.relativeName) ? String(f.relativeName) : 'file';
       const ext = getExtensionAscii(relativeName) || '';
@@ -2133,7 +2134,7 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/signed-urls
       if (error) return res.status(500).json({ error: error.message });
       urls.push({ path: data.path, token: data.token });
     }
-    res.json({ bucket: MANUAL_BUCKET, urls });
+    res.json({ bucket: MANUAL_BUCKET, urls, folderId: folderId || undefined });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
