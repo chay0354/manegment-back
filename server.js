@@ -1811,7 +1811,7 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
         const form = new FormData();
         form.append('file', buffer, { filename: originalName });
         const ingestRes = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-          timeout: 120000,
+          timeout: 180000,
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
           headers: form.getHeaders()
@@ -1859,7 +1859,7 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
     const form = new FormData();
     form.append('file', file.buffer, { filename: originalName });
     const r = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-      timeout: 120000,
+      timeout: 180000,
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
       headers: form.getHeaders()
@@ -2346,7 +2346,7 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     const form = new FormData();
     form.append('file', buffer, { filename: originalName });
     const ingestRes = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-      timeout: 120000,
+      timeout: 180000,
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
       headers: form.getHeaders()
