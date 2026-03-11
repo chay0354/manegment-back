@@ -2198,7 +2198,8 @@ app.get('/api/projects/:projectId/files/upload-to-sharepoint-bucket/progress', a
     const uploadId = req.query.uploadId;
     if (!uploadId) return res.status(400).json({ error: 'uploadId required' });
     const progress = sharepointUploadProgressMap.get(uploadId);
-    if (!progress) return res.status(404).json({ error: 'No progress' });
+    // On Vercel/serverless, progress is in-memory per instance; polling may hit another instance. Return 200 with unknown so frontend does not treat as failure.
+    if (!progress) return res.status(200).json({ file: null, total: null, phase: 'unknown' });
     res.json(progress);
   } catch (e) {
     res.status(500).json({ error: e.message });
