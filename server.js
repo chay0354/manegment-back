@@ -1537,14 +1537,31 @@ app.post('/api/projects/:projectId/guard/check', async (req, res) => {
   }
 });
 
-async function logAnalysis(projectId, analysisType, inputRef, result, requestId) {
+function analysisInputHash(analysisType, input) {
+  try {
+    const str = typeof input === 'string' ? input : JSON.stringify(input);
+    return crypto.createHash('sha256').update(str).digest('hex');
+  } catch (_) { return null; }
+}
+
+async function getCachedAnalysis(projectId, analysisType, inputHash) {
+  if (!inputHash) return null;
+  try {
+    const { data, error } = await supabase.from('analysis_log').select('result').eq('project_id', projectId).eq('analysis_type', analysisType).eq('input_hash', inputHash).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (error || !data) return null;
+    return data.result;
+  } catch (_) { return null; }
+}
+
+async function logAnalysis(projectId, analysisType, inputRef, result, requestId, inputHash = null) {
   try {
     await supabase.from('analysis_log').insert({
       project_id: projectId,
       analysis_type: analysisType,
       input_ref: inputRef || null,
       result: result || {},
-      request_id: requestId || null
+      request_id: requestId || null,
+      input_hash: inputHash || null
     });
   } catch (_) { /* table may not exist yet */ }
 }
@@ -1593,6 +1610,10 @@ app.post('/api/projects/:projectId/analysis/formulation-intelligence', async (re
     if (!ctx) return;
     const projectId = req.params.projectId;
     const { formula, domain, materials, percentages } = req.body || {};
+    const inputHash = analysisInputHash('formulation_intelligence', { formula, domain, materials, percentages });
+    const cached = await getCachedAnalysis(projectId, 'formulation_intelligence', inputHash);
+    if (cached) return res.json(cached);
+
     const issues = [];
     let status = 'OK';
 
@@ -1661,7 +1682,7 @@ app.post('/api/projects/:projectId/analysis/formulation-intelligence', async (re
     } catch (_) { /* materials table may not exist */ }
 
     const result = { status, issues };
-    await logAnalysis(projectId, 'formulation_intelligence', null, result, req.requestId);
+    await logAnalysis(projectId, 'formulation_intelligence', null, result, req.requestId, inputHash);
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1675,14 +1696,35 @@ app.get('/api/projects/:projectId/analysis/similar-experiments', async (req, res
     const projectId = req.params.projectId;
     const experimentIdParam = req.query.experiment_id;
     if (!experimentIdParam) return res.status(400).json({ error: 'experiment_id query is required' });
+    const outcomeFilter = req.query.experiment_outcome; // optional: success | failure | partial | production_formula
+    const pctMin = req.query.material_pct_min != null ? parseFloat(req.query.material_pct_min) : null;
+    const pctMax = req.query.material_pct_max != null ? parseFloat(req.query.material_pct_max) : null;
+
+    const inputHash = analysisInputHash('similar_experiments', { experiment_id: experimentIdParam, experiment_outcome: outcomeFilter, material_pct_min: pctMin, material_pct_max: pctMax });
+    const cached = await getCachedAnalysis(projectId, 'similar_experiments', inputHash);
+    if (cached) return res.json(cached);
 
     const experiments = await getExperimentsForAnalysis(projectId);
     const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(experimentIdParam);
     const source = experiments.find(e => isUuid ? e.id === experimentIdParam : e.experiment_id === experimentIdParam);
     if (!source) return res.status(404).json({ error: 'Experiment not found' });
 
-    const withScore = experiments
-      .filter(e => e.id !== source.id && e.experiment_id !== source.experiment_id)
+    let candidates = experiments.filter(e => e.id !== source.id && e.experiment_id !== source.experiment_id);
+    if (outcomeFilter) candidates = candidates.filter(e => e.experiment_outcome === outcomeFilter);
+    if (pctMin != null && !isNaN(pctMin) || pctMax != null && !isNaN(pctMax)) {
+      candidates = candidates.filter(e => {
+        const perc = getPercentagesMap(e);
+        const vals = Object.values(perc);
+        if (vals.length === 0) return false;
+        const minP = Math.min(...vals);
+        const maxP = Math.max(...vals);
+        if (pctMin != null && !isNaN(pctMin) && maxP < pctMin) return false;
+        if (pctMax != null && !isNaN(pctMax) && minP > pctMax) return false;
+        return true;
+      });
+    }
+
+    const withScore = candidates
       .map(e => ({ experiment: e, score: similarityScore(source, e) }))
       .filter(x => x.score > 0.1)
       .sort((a, b) => b.score - a.score)
@@ -1697,7 +1739,7 @@ app.get('/api/projects/:projectId/analysis/similar-experiments', async (req, res
       }));
 
     const result = { source_experiment_id: source.experiment_id, similar: withScore };
-    await logAnalysis(projectId, 'similar_experiments', source.experiment_id, result, req.requestId);
+    await logAnalysis(projectId, 'similar_experiments', source.experiment_id, result, req.requestId, inputHash);
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });

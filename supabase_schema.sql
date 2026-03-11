@@ -222,6 +222,33 @@ CREATE TABLE IF NOT EXISTS lab_experiments (
 CREATE INDEX IF NOT EXISTS lab_experiments_project_id_idx ON lab_experiments(project_id);
 CREATE INDEX IF NOT EXISTS lab_experiments_source_idx ON lab_experiments(source_file_reference);
 CREATE INDEX IF NOT EXISTS lab_experiments_session_idx ON lab_experiments(research_session_id);
+ALTER TABLE lab_experiments ADD COLUMN IF NOT EXISTS parent_experiment_id UUID REFERENCES lab_experiments(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS lab_experiments_parent_experiment_id_idx ON lab_experiments(parent_experiment_id) WHERE parent_experiment_id IS NOT NULL;
+
+-- 3b. Experiment materials (relation + role for pattern/similarity)
+CREATE TABLE IF NOT EXISTS experiment_materials (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  experiment_id UUID NOT NULL REFERENCES lab_experiments(id) ON DELETE CASCADE,
+  material_id TEXT NOT NULL,
+  role TEXT CHECK (role IS NULL OR role IN ('main', 'secondary', 'additive', 'catalyst', 'solvent')),
+  percentage NUMERIC,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(experiment_id, material_id)
+);
+CREATE INDEX IF NOT EXISTS experiment_materials_experiment_id_idx ON experiment_materials(experiment_id);
+CREATE INDEX IF NOT EXISTS experiment_materials_material_id_idx ON experiment_materials(material_id);
+
+-- 3c. Experiment relations (optional: for future knowledge map)
+CREATE TABLE IF NOT EXISTS experiment_relations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  source_experiment_id UUID NOT NULL REFERENCES lab_experiments(id) ON DELETE CASCADE,
+  target_experiment_id UUID NOT NULL REFERENCES lab_experiments(id) ON DELETE CASCADE,
+  relationship_type TEXT NOT NULL CHECK (relationship_type IN ('derived_from', 'similar_to', 'inspired_by')),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(source_experiment_id, target_experiment_id, relationship_type)
+);
+CREATE INDEX IF NOT EXISTS experiment_relations_source_idx ON experiment_relations(source_experiment_id);
+CREATE INDEX IF NOT EXISTS experiment_relations_target_idx ON experiment_relations(target_experiment_id);
 
 -- 4. Material Library – central raw materials for analysis
 CREATE TABLE IF NOT EXISTS material_library (
