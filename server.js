@@ -30,6 +30,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
+app.set('trust proxy', 1); // Vercel sends X-Forwarded-For; required for express-rate-limit to identify clients correctly
 // Full CORS: allow any origin, all methods, all headers (so any URL can call the API)
 function corsHeaders(req, res, next) {
   const origin = req.headers.origin;
@@ -2043,6 +2044,7 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     }
     const projCache = bucketListCache.byProject[projectId];
     if (projCache && now < projCache.expiresAt) {
+      console.log('[sharepoint-bucket] serving from cache for projectId=', projectId, '| displayNamesMap keys=', Object.keys(projCache.displayNamesMap).length);
       const withDisplay = files.map(f => ({ ...f, displayName: projCache.safeDisplay(f.path, f.name) }));
       return res.json({ files: withDisplay, displayNamesMap: projCache.displayNamesMap });
     }
@@ -2053,6 +2055,7 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     ]);
     if (dbErr) console.warn('[sharepoint-bucket] display_names query failed (run migration 005?):', dbErr.message);
     const dbRows = dbRowsRaw || [];
+    console.log('[sharepoint-bucket] projectId=', projectId, '| dbRows=', dbRows.length, '| sample DB paths=', dbRows.slice(0, 5).map(r => r.path));
     const dbMap = {};
     for (const row of dbRows || []) {
       if (row.path != null && row.display_name != null) dbMap[prefix + row.path] = row.display_name;
@@ -2065,6 +2068,8 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
     for (const row of dbRows || []) {
       if (row.path != null && row.display_name != null) displayNamesMap[MANUAL_PREFIX + '/' + row.path] = row.display_name;
     }
+    const manualPaths = displayNamesMap ? Object.keys(displayNamesMap).filter(p => p.startsWith(MANUAL_PREFIX + '/')) : [];
+    console.log('[sharepoint-bucket] displayNamesMap manual keys=', manualPaths.length, '| sample=', manualPaths.slice(0, 5));
     const safeDisplay = (path, name) => {
       const d = displayNamesMap[path] ?? mapping[path];
       if (d == null || d === '' || d === '_') return name || path;
@@ -2072,6 +2077,10 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
       return d;
     };
     const withDisplay = files.map(f => ({ ...f, displayName: safeDisplay(f.path, f.name) }));
+    const manualFiles = withDisplay.filter(f => (f.path || '').startsWith('manual/'));
+    const fromDb = manualFiles.filter(f => displayNamesMap[f.path] != null).length;
+    const fromFallback = manualFiles.length - fromDb;
+    console.log('[sharepoint-bucket] withDisplay: manual files=', manualFiles.length, '| with display from DB/map=', fromDb, '| fallback (name/path)=', fromFallback);
     if (dbRows.length > 0) {
       bucketListCache.byProject[projectId] = { displayNamesMap, safeDisplay, expiresAt: now + BUCKET_DISPLAY_NAMES_CACHE_TTL_MS };
     }
@@ -2155,7 +2164,10 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/update-disp
     if (!mappings || typeof mappings !== 'object') return res.status(400).json({ error: 'Body must include mappings: { "storagePath": "displayName", ... }' });
 
     const prefix = `${PROJECT_PREFIX}${projectId}/`;
-    if (Object.keys(mappings).length > 0) console.log('[update-display-names] projectId=', projectId, 'prefix=', prefix, 'mappingKeys=', Object.keys(mappings).slice(0, 3));
+    if (Object.keys(mappings).length > 0) {
+      const keys = Object.keys(mappings);
+      console.log('[update-display-names] projectId=', projectId, '| count=', keys.length, '| sample paths=', keys.slice(0, 5), '| sample displayNames=', keys.slice(0, 5).map(k => mappings[k]));
+    }
     for (const [rawPath, displayName] of Object.entries(mappings)) {
       const d = String(displayName ?? '').trim();
       if (!d) continue;
