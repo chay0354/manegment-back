@@ -2204,7 +2204,7 @@ app.get('/api/projects/:projectId/files/upload-to-sharepoint-bucket/progress', a
   }
 });
 
-app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUpload, upload.array('files', 50), async (req, res) => {
+app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUpload, upload.fields([{ name: 'files', maxCount: 50 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
   const uploadId = req.headers['x-upload-id'] || null;
   const setProgress = (file, total, phase) => {
     if (uploadId) sharepointUploadProgressMap.set(uploadId, { file, total, phase });
@@ -2213,7 +2213,10 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
     const projectId = req.params.projectId;
-    const files = req.files || [];
+    const raw = req.files || {};
+    const filesArray = raw.files ? (Array.isArray(raw.files) ? raw.files : [raw.files]) : [];
+    const fileSingle = raw.file ? (Array.isArray(raw.file) ? raw.file[0] : raw.file) : null;
+    const files = filesArray.length ? filesArray : (fileSingle ? [fileSingle] : []);
     if (files.length === 0) return res.status(400).json({ error: 'No files provided. Send multipart form with "files" (and optional "folderPath").' });
     const folderPath = (req.body && req.body.folderPath != null) ? String(req.body.folderPath).trim() : '';
     let fileNames = null;
