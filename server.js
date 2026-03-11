@@ -2188,7 +2188,27 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/update-disp
   }
 });
 
+const sharepointUploadProgressMap = new Map();
+
+app.get('/api/projects/:projectId/files/upload-to-sharepoint-bucket/progress', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const uploadId = req.query.uploadId;
+    if (!uploadId) return res.status(400).json({ error: 'uploadId required' });
+    const progress = sharepointUploadProgressMap.get(uploadId);
+    if (!progress) return res.status(404).json({ error: 'No progress' });
+    res.json(progress);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUpload, upload.array('files', 50), async (req, res) => {
+  const uploadId = req.headers['x-upload-id'] || null;
+  const setProgress = (file, total, phase) => {
+    if (uploadId) sharepointUploadProgressMap.set(uploadId, { file, total, phase });
+  };
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
@@ -2221,11 +2241,24 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
       return folderId ? `${folderId}/${fileId}${ext}` : `${fileId}${ext}`;
     });
     if (folderPath) console.log('[SharePoint upload] bucket=', MANUAL_BUCKET, 'folderPath(display)=', folderPath, 'storagePrefix=', folderId, 'supabaseProject=', (SUPABASE_URL || '').replace(/^https:\/\/([^.]+).*/, '$1'));
+    const UPLOAD_FILE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per file
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const relativeName = fileNames ? String(fileNames[i] ?? '').trim() || file.originalname || file.name || 'file' : file.originalname || file.name || 'file';
       const storagePath = storagePaths[i];
-      const { data: uploadData, error } = await supabase.storage.from(MANUAL_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype || 'application/octet-stream', upsert: true });
+      console.log('[SharePoint upload] uploading file', i + 1, '/', files.length, 'path=', storagePath, 'size=', Math.round((file.buffer?.length || 0) / 1024), 'KB');
+      let result;
+      try {
+        result = await Promise.race([
+          supabase.storage.from(MANUAL_BUCKET).upload(storagePath, file.buffer, { contentType: file.mimetype || 'application/octet-stream', upsert: true }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('Upload timeout')), UPLOAD_FILE_TIMEOUT_MS))
+        ]);
+      } catch (raceErr) {
+        console.error('[SharePoint upload] FAIL path=', storagePath, 'error=', raceErr.message);
+        failed.push({ name: relativeName, error: raceErr.message });
+        continue;
+      }
+      const { error } = result;
       if (error) {
         console.error('[SharePoint upload] FAIL path=', storagePath, 'error=', error.message);
         failed.push({ name: relativeName, error: error.message });
@@ -2233,7 +2266,10 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
         console.log('[SharePoint upload] OK path=', storagePath);
         uploaded.push({ path: storagePath, name: relativeName });
       }
+      setProgress(i + 1, files.length, 'files');
     }
+    console.log('[SharePoint upload] all files done, saving display names...');
+    setProgress(files.length, files.length, 'displayNames');
     if (uploaded.length > 0) {
       for (const u of uploaded) {
         const relativePath = u.path.startsWith(PROJECT_PREFIX)
@@ -2262,6 +2298,8 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     bucketListCache.filesExpiresAt = 0;
     bucketListCache.byProject = {};
     const supabaseProjectRef = (SUPABASE_URL || '').match(/https:\/\/([^.]+)\.supabase\.co/)?.[1] || 'unknown';
+    console.log('[SharePoint upload] sending response uploaded=', uploaded.length, 'failed=', failed.length);
+    if (uploadId) sharepointUploadProgressMap.delete(uploadId);
     res.status(201).json({
       uploaded: uploaded.length,
       failed: failed.length,
@@ -2272,7 +2310,8 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     });
   } catch (e) {
     console.error('[SharePoint upload] route error:', e.message);
-    res.status(500).json({ error: e.message });
+    if (uploadId) sharepointUploadProgressMap.delete(uploadId);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
