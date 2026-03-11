@@ -731,13 +731,14 @@ function forwardAuth(method, path, req, res) {
       const statusFromMatriya = e.response?.status;
       const bodyFromMatriya = e.response?.data;
       console.error(`Auth forward ${method} ${path} →`, code || statusFromMatriya, bodyFromMatriya || e.message);
+      const errString = (b) => (typeof b === 'object' && b !== null && typeof b.error === 'string' ? b.error : (b?.message || b?.detail || e.message || 'Auth request failed'));
       if (statusFromMatriya != null) {
-        return res.status(statusFromMatriya).json(typeof bodyFromMatriya === 'object' ? bodyFromMatriya : { error: e.message });
+        return res.status(statusFromMatriya).json({ error: errString(bodyFromMatriya) });
       }
       if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ETIMEDOUT') {
         return res.status(503).json({ error: 'Cannot reach Matriya. Is it running? Check MATRIYA_BACK_URL in .env.' });
       }
-      res.status(500).json({ error: bodyFromMatriya?.error || e.message || 'Auth request failed' });
+      res.status(500).json({ error: errString(bodyFromMatriya) });
     });
 }
 
