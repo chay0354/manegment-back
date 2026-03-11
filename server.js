@@ -76,6 +76,8 @@ function parsePagination(req) {
 
 // Root (for Vercel / health checks)
 app.get('/', (req, res) => res.json({ service: 'maneger-back', health: '/health', api: '/api' }));
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/favicon.png', (req, res) => res.status(204).end());
 
 // ---------- Projects ----------
 app.get('/api/projects', async (req, res) => {
@@ -2090,6 +2092,21 @@ app.get('/api/projects/:projectId/files/sharepoint-bucket', async (req, res) => 
   }
 });
 
+// Public Supabase config for direct-to-bucket upload from frontend (avoids 413 / CORS on Vercel; set SUPABASE_ANON_KEY or NEXT_PUBLIC_SUPABASE_ANON_KEY in production).
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+app.get('/api/projects/:projectId/files/upload-to-sharepoint-bucket/config', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return res.json({ useDirectUpload: false });
+    }
+    res.json({ useDirectUpload: true, supabaseUrl: SUPABASE_URL, supabaseAnonKey: SUPABASE_ANON_KEY });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Get signed upload URLs for direct-to-bucket upload from frontend (faster, no file through server).
 // Storage paths are ASCII-only (random ids) because Hebrew is not supported in Supabase Storage; display names (Hebrew/English) are stored in DB and shown in the frontend.
 app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket/signed-urls', limiterUpload, async (req, res) => {
@@ -2243,8 +2260,9 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     const filesArray = raw.files ? (Array.isArray(raw.files) ? raw.files : [raw.files]) : [];
     const fileSingle = raw.file ? (Array.isArray(raw.file) ? raw.file[0] : raw.file) : null;
     const files = filesArray.length ? filesArray : (fileSingle ? [fileSingle] : []);
-    if (files.length === 0) return res.status(400).json({ error: 'No files provided. Send multipart form with "files" (and optional "folderPath").' });
+    if (files.length === 0) return res.status(400).json({ error: 'No files provided. Send multipart form with "files" (and optional "folderPath", "folderId" for chunked upload).' });
     const folderPath = (req.body && req.body.folderPath != null) ? String(req.body.folderPath).trim() : '';
+    const existingFolderId = (req.body && typeof req.body.folderId === 'string') ? String(req.body.folderId).trim() : null;
     let fileNames = null;
     try {
       if (req.body && typeof req.body.fileNamesB64 === 'string') {
@@ -2262,7 +2280,7 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     await ensureManualBucketExists();
     const uploaded = [];
     const failed = [];
-    const folderId = folderPath ? randomAsciiId(8) : null;
+    const folderId = folderPath ? (existingFolderId || randomAsciiId(8)) : null;
     const storagePaths = files.map((file, i) => {
       const relativeName = fileNames ? String(fileNames[i] ?? '').trim() || file.originalname || file.name || 'file' : file.originalname || file.name || 'file';
       const ext = getExtensionAscii(relativeName) || '';
@@ -2329,14 +2347,16 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     const supabaseProjectRef = (SUPABASE_URL || '').match(/https:\/\/([^.]+)\.supabase\.co/)?.[1] || 'unknown';
     console.log('[SharePoint upload] sending response uploaded=', uploaded.length, 'failed=', failed.length);
     if (uploadId) sharepointUploadProgressMap.delete(uploadId);
-    res.status(201).json({
+    const payload = {
       uploaded: uploaded.length,
       failed: failed.length,
       uploaded_paths: uploaded,
       errors: failed.length ? failed : undefined,
       bucket: MANUAL_BUCKET,
       supabase_project: supabaseProjectRef
-    });
+    };
+    if (folderPath && folderId) payload.folderId = folderId;
+    res.status(201).json(payload);
   } catch (e) {
     console.error('[SharePoint upload] route error:', e.message);
     if (uploadId) sharepointUploadProgressMap.delete(uploadId);
