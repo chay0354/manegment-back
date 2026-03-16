@@ -78,6 +78,19 @@ ALTER TABLE project_files ADD COLUMN IF NOT EXISTS folder_display_name TEXT;
 
 CREATE INDEX IF NOT EXISTS project_files_project_id_idx ON project_files(project_id);
 
+-- Display names for bucket paths (Hebrew/English names for "folder 1", "file 1.pdf" etc.)
+CREATE TABLE IF NOT EXISTS sharepoint_display_names (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(project_id, path)
+);
+CREATE INDEX IF NOT EXISTS sharepoint_display_names_project_id_idx ON sharepoint_display_names(project_id);
+CREATE INDEX IF NOT EXISTS sharepoint_display_names_path_idx ON sharepoint_display_names(project_id, path);
+
 -- SharePoint pull idempotency: one row per request_id (ON CONFLICT DO NOTHING)
 CREATE TABLE IF NOT EXISTS sharepoint_pull_requests (
   request_id TEXT PRIMARY KEY,

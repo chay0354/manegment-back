@@ -1,0 +1,13 @@
+=== RAG production check ===
+Manager URL: http://localhost:8001
+
+[OK] RAG health: Matriya is reachable from manager
+
+[OK] Research session created: 459e7175-bf33-4ec2-a87c-07763d6d65ce
+[OK] Research run returned 200
+[OK] Got synthesis text (393 chars)
+
+--- Summary ---
+RAG health: OK
+Research session: OK
+Research run: OK (answer length 393)
