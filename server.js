@@ -54,7 +54,11 @@ app.use((req, res, next) => {
 
 // Rate limiting: auth strict, upload/chat/rag moderate, general API relaxed
 const limiterAuth = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Too many auth attempts' } });
-const limiterUpload = rateLimit({ windowMs: 60 * 1000, max: 15, message: { error: 'Too many uploads' } });
+const limiterUpload = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.UPLOAD_RATE_LIMIT_MAX, 10) || 100,
+  message: { error: 'Too many uploads' }
+});
 const limiterSharePoint = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many SharePoint pull requests' } });
 const limiterRag = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Too many RAG requests' } });
 const limiterGeneral = rateLimit({ windowMs: 60 * 1000, max: 200, message: { error: 'Too many requests' } });
@@ -1537,6 +1541,162 @@ app.post('/api/projects/:projectId/guard/check', async (req, res) => {
   }
 });
 
+// ---------- Lab: parse experiment file to text (Excel → readable text for AI) ----------
+app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, upload.single('file'), async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded. Send multipart form with field "file".' });
+    const name = (req.file.originalname || '').toLowerCase();
+    if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+      const parts = [];
+      for (const sheetName of wb.SheetNames || []) {
+        const ws = wb.Sheets[sheetName];
+        if (!ws) continue;
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false, header: 1 });
+        if (rows.length) {
+          parts.push(`[גיליון: ${sheetName}]`);
+          for (const row of rows) {
+            const line = Array.isArray(row) ? row.map(c => String(c ?? '').trim()).join('\t') : Object.entries(row).map(([k, v]) => `${k}: ${v}`).join(', ');
+            if (line.replace(/\s/g, '')) parts.push(line);
+          }
+          parts.push('');
+        }
+      }
+      const text = parts.join('\n').trim() || 'הקובץ ריק או ללא נתונים ניתנים לקריאה.';
+      return res.json({ text });
+    }
+    if (name.endsWith('.csv') || name.endsWith('.txt') || name.endsWith('.json')) {
+      const raw = req.file.buffer.toString('utf-8');
+      const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim() || 'הקובץ ריק.';
+      return res.json({ text });
+    }
+    return res.status(400).json({ error: 'סוג קובץ לא נתמך. השתמש ב־XLSX, XLS, CSV, TXT או JSON.' });
+  } catch (e) {
+    if (e.message && /corrupt|invalid|xlsx|workbook/i.test(e.message)) return res.status(400).json({ error: 'קובץ Excel פגום או בפורמט לא נתמך.' });
+    res.status(500).json({ error: e.message || 'שגיאה בפענוח הקובץ.' });
+  }
+});
+
+// ---------- Lab saved experiment contexts (save/load text for AI) ----------
+app.get('/api/projects/:projectId/lab/saved-experiments', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { data, error } = await supabase
+      .from('lab_saved_experiment_contexts')
+      .select('id, name, content, created_at')
+      .eq('project_id', req.params.projectId)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ saved: data || [] });
+  } catch (e) {
+    if (String(e.message || '').includes('does not exist') || String(e.message || '').includes('relation')) {
+      return res.json({ saved: [] });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/lab/saved-experiments', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { name, content } = req.body || {};
+    const projectId = req.params.projectId;
+    const trimName = typeof name === 'string' ? name.trim() : '';
+    if (!trimName) return res.status(400).json({ error: 'name is required' });
+    const { data, error } = await supabase
+      .from('lab_saved_experiment_contexts')
+      .insert({ project_id: projectId, name: trimName, content: typeof content === 'string' ? content : '' })
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/projects/:projectId/lab/saved-experiments/:id', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const { error } = await supabase
+      .from('lab_saved_experiment_contexts')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('project_id', req.params.projectId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Lab AI insights (OpenAI GPT) ----------
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const LAB_AI_INSIGHT_TASKS = {
+  insights: { title: 'תובנות מהדאטה', instruction: 'סכם תובנות עיקריות מהנתונים: שיעור הצלחה, כישלונות, מגמות לפי תחום. תן סיכום תמציתי בעברית.' },
+  contradictions: { title: 'זיהוי סתירות', instruction: 'זהה סתירות: אותה פורמולה עם תוצאות שונות. רשום כל סתירה עם מזהי הניסויים והתוצאות. אם אין – כתוב שאין סתירות. עברית.' },
+  'failure-patterns': { title: 'דפוסי כישלון', instruction: 'ניתוח דפוסי כישלון: לפי תחום טכנולוגי ולפי חומר. רשום ספירות ומגמות. עברית.' },
+  snapshot: { title: 'ניתוח סנאפשוט מחקר', instruction: 'סנאפשוט של מצב המחקר: סה"כ ניסויים, התפלגות תוצאות (הצלחה/כישלון/חלקי), לפי תחום. עברית.' },
+  'formula-validate': { title: 'אימות פורמולה', instruction: 'בדוק אם יש פורמולה/הרכב בנתונים – האם תקין (מאזן מסה, טווחים), אזהרות או שגיאות. אם אין פורמולה מפורשת – כתוב כך. עברית.' },
+  'formulation-intelligence': { title: 'Formulation Intelligence', instruction: 'בדיקה לפני ניסוי: מאזן מסה, טווחי חומרים, התאמה לניסויים קיימים. סטטוס: OK / אזהרה / סיכון. עברית.' },
+  'similar-experiments': { title: 'ניסויים דומים', instruction: 'זהה קבוצות של ניסויים דומים (חומרים/פרופורציות דומים). רשום ניסויים דומים והתוצאות. עברית.' },
+  relations: { title: 'קשרים (ניסוי / פורמולה / חומר / תוצאה)', instruction: 'סכם קשרים בין ניסויים, פורמולות, חומרים ותוצאות. רשימה תמציתית. עברית.' },
+  guard: { title: 'Research Guard', instruction: 'בדיקת כפילויות ואזהרות: פורמולות כפולות, סיכונים. האם מותר להמשיך או שיש אזהרות. עברית.' },
+  experiments: { title: 'רשימת ניסויים', instruction: 'סיכום רשימת הניסויים: מזהים, תחום, תוצאה, פורמולה (קיצור). עברית.' },
+  'suggestion-engine': {
+    title: 'Suggestion Engine – מנוע הצעות',
+    instruction: `מנגנון שמנתח ניסויים קיימים ומציע ניסויים חדשים. בהתבסס על הנתונים:
+1) זהה אזורים שלא נבדקו במרחב הפורמולציות.
+2) זהה גבולות יציבות בין ניסויים מוצלחים לנכשלים.
+3) זהה קומבינציות חומרים שלא נבדקו.
+הפלט: 3–5 הצעות לניסויים. לכל הצעה כלול: פורמולציה מוצעת, ציון confidence/סיכון (confidence/risk score), והסבר קצר למה הניסוי הוצע. כל התשובה בעברית.`
+  }
+};
+
+app.post('/api/projects/:projectId/lab/ai-insight', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set. Add your key to .env for Lab AI insights.' });
+    const { experimentContext, insightType } = req.body || {};
+    const context = typeof experimentContext === 'string' ? experimentContext.trim() : '';
+    const task = LAB_AI_INSIGHT_TASKS[insightType];
+    if (!task || !context) return res.status(400).json({ error: 'Body must include experimentContext (string) and insightType (one of: ' + Object.keys(LAB_AI_INSIGHT_TASKS).join(', ') + ').' });
+    const systemPrompt = `אתה מומחה לניתוח נתוני ניסויים ומעבדה. אתה מקבל טקסט או נתוני ניסוי ומבצע את המשימה המבוקשת. כל התשובות בעברית בלבד.`;
+    const userPrompt = `משימה: ${task.title}\n\nהוראות: ${task.instruction}\n\nנתוני הניסוי/הקשר:\n${context.slice(0, 12000)}`;
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: 2000,
+        temperature: 0.3
+      },
+      {
+        headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 60000
+      }
+    );
+    const text = response.data?.choices?.[0]?.message?.content?.trim() || '';
+    if (!text) return res.status(502).json({ error: 'OpenAI returned empty response' });
+    res.json({ text });
+  } catch (e) {
+    const status = e.response?.status;
+    const msg = e.response?.data?.error?.message || e.message;
+    if (status === 401) return res.status(502).json({ error: 'Invalid OpenAI API key' });
+    if (status === 429) return res.status(429).json({ error: 'Rate limit – try again in a moment' });
+    res.status(status && status >= 400 && status < 600 ? status : 500).json({ error: msg || 'Lab AI request failed' });
+  }
+});
+
 function analysisInputHash(analysisType, input) {
   try {
     const str = typeof input === 'string' ? input : JSON.stringify(input);
@@ -1799,12 +1959,40 @@ async function getSiteIdFromUrl(siteUrl, token) {
 }
 
 // ---------- Project files (upload → Matriya ingest, metadata in Supabase) ----------
+/** Run ingest in background after response sent; on failure update project_files.ingest_error */
+function ingestFileInBackground(projectFileId, buffer, originalName) {
+  if (!MATRIYA_BACK_URL) return;
+  (async () => {
+    try {
+      const form = new FormData();
+      form.append('file', buffer, { filename: originalName });
+      const r = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
+        timeout: 180000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        headers: form.getHeaders()
+      });
+      if (!r.data || !r.data.success) {
+        const errMsg = r.data?.error || 'Matriya ingestion failed';
+        await supabase.from('project_files').update({ ingest_error: errMsg }).eq('id', projectFileId);
+      }
+    } catch (e) {
+      const errMsg = e.response?.data?.error || e.message || 'Indexing failed';
+      await supabase.from('project_files').update({ ingest_error: errMsg }).eq('id', projectFileId).then(() => {}, () => {});
+    }
+  })();
+}
+
 app.get('/api/projects/:projectId/files', async (req, res) => {
   try {
-    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    const projectId = req.params.projectId;
+    if (!projectId || typeof projectId !== 'string' || !projectId.trim()) {
+      return res.status(400).json({ error: 'project_id required' });
+    }
+    const ctx = await requireProjectMember(req, res, projectId);
     if (!ctx) return;
     const { limit, offset } = parsePagination(req);
-    const { data, error } = await supabase.from('project_files').select('*').eq('project_id', req.params.projectId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    const { data, error } = await supabase.from('project_files').select('*').eq('project_id', projectId.trim()).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) {
       const msg = String(error.message || error);
       if (msg.includes('does not exist') || msg.includes('relation') || msg.includes('project_files')) {
@@ -1907,31 +2095,24 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
   if (!req.file) {
     return res.status(400).json({ error: 'No file provided' });
   }
-  if (!MATRIYA_BACK_URL) {
-    return res.status(503).json({ error: 'MATRIYA_BACK_URL not set – cannot ingest files' });
-  }
   const file = req.file;
   const utf8Name = req.body && typeof req.body.originalName === 'string' && req.body.originalName.trim();
   const originalName = (utf8Name ? req.body.originalName.trim() : null) || file.originalname || 'file';
+  const folderDisplayName = req.body && typeof req.body.folder_display_name === 'string' && req.body.folder_display_name.trim() ? req.body.folder_display_name.trim() : null;
   try {
-    const form = new FormData();
-    form.append('file', file.buffer, { filename: originalName });
-    const r = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-      timeout: 180000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      headers: form.getHeaders()
-    });
-    if (!r.data || !r.data.success) {
-      return res.status(500).json({ error: r.data?.error || 'Matriya ingestion failed' });
-    }
-    const { data, error } = await supabase.from('project_files').insert({
+    const { data: row, error: insertErr } = await supabase.from('project_files').insert({
       project_id: projectId,
-      original_name: originalName
+      original_name: originalName,
+      folder_display_name: folderDisplayName || null
     }).select().single();
-    if (error) throw error;
-    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', data.id, { original_name: originalName }, req.requestId);
-    res.status(201).json(data);
+    if (insertErr) throw insertErr;
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName }, req.requestId);
+
+    res.status(201).json(row);
+    if (MATRIYA_BACK_URL && file.buffer) {
+      const buffer = Buffer.from(file.buffer);
+      setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
+    }
   } catch (e) {
     const status = e.response?.status || 500;
     const data = e.response?.data || { error: e.message };
@@ -2421,7 +2602,6 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     if (!ctx) return;
     const path = req.body?.path;
     if (!path || typeof path !== 'string') return res.status(400).json({ error: 'path is required' });
-    if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
     const { bucket, storagePath } = resolveBucketAndPath(path);
     let displayName = req.body?.displayName;
     if (!displayName || typeof displayName !== 'string') {
@@ -2432,23 +2612,21 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     if (downloadError || !blob) return res.status(404).json({ error: downloadError?.message || 'File not found in bucket' });
     const buffer = Buffer.from(await blob.arrayBuffer());
     const originalName = displayName;
-    const form = new FormData();
-    form.append('file', buffer, { filename: originalName });
-    const ingestRes = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-      timeout: 180000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      headers: form.getHeaders()
-    });
-    if (!ingestRes.data?.success) return res.status(500).json({ error: ingestRes.data?.error || 'Matriya ingestion failed' });
+
+    const folderDisplayName = req.body?.folder_display_name != null ? String(req.body.folder_display_name).trim() || null : null;
     const { data: row, error } = await supabase.from('project_files').insert({
       project_id: projectId,
       original_name: originalName,
-      storage_path: path
+      storage_path: path,
+      folder_display_name: folderDisplayName || null
     }).select().single();
     if (error) throw error;
     auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName, source: 'sharepoint_bucket' }, req.requestId);
+
     res.status(201).json(row);
+    if (MATRIYA_BACK_URL) {
+      setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
+    }
   } catch (e) {
     res.status(e.response?.status || 500).json({ error: e.response?.data?.error || e.message });
   }

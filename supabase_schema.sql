@@ -68,9 +68,13 @@ CREATE TABLE IF NOT EXISTS project_files (
   project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   original_name TEXT NOT NULL,
   storage_path TEXT,
+  ingest_error TEXT,
+  folder_display_name TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS storage_path TEXT;
+ALTER TABLE project_files ADD COLUMN IF NOT EXISTS ingest_error TEXT;
+ALTER TABLE project_files ADD COLUMN IF NOT EXISTS folder_display_name TEXT;
 
 CREATE INDEX IF NOT EXISTS project_files_project_id_idx ON project_files(project_id);
 
@@ -260,6 +264,16 @@ CREATE TABLE IF NOT EXISTS material_library (
   UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS material_library_project_id_idx ON material_library(project_id);
+
+-- Saved experiment contexts (Lab tab: name + content for AI analysis, per project)
+CREATE TABLE IF NOT EXISTS lab_saved_experiment_contexts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS lab_saved_experiment_contexts_project_id_idx ON lab_saved_experiment_contexts(project_id);
 
 -- If tasks table already existed with old status constraint, run to add 'in_review':
 -- ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
