@@ -1968,6 +1968,13 @@ async function getSiteIdFromUrl(siteUrl, token) {
 }
 
 // ---------- Project files (upload → Matriya ingest, metadata in Supabase) ----------
+/** Extensions that Matriya can index (ingest). */
+const MATRIYA_INGEST_EXTENSIONS = ['.pdf', '.docx', '.txt', '.doc', '.xlsx', '.xls'];
+function isMatriyaIngestible(filename) {
+  const ext = (filename || '').toLowerCase().replace(/^.*\./, '');
+  return MATRIYA_INGEST_EXTENSIONS.some(e => e.slice(1) === ext);
+}
+
 /** Run ingest in background after response sent; on failure update project_files.ingest_error */
 function ingestFileInBackground(projectFileId, buffer, originalName) {
   if (!MATRIYA_BACK_URL) return;
@@ -2545,6 +2552,16 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
       } else {
         console.log('[SharePoint upload] OK path=', storagePath);
         uploaded.push({ path: storagePath, name: relativeName });
+        const fullStoragePath = MANUAL_PREFIX + '/' + storagePath;
+        const { data: fileRow, error: insertErr } = await supabase.from('project_files').insert({
+          project_id: projectId,
+          original_name: relativeName,
+          storage_path: fullStoragePath,
+          folder_display_name: folderPath || null
+        }).select('id').single();
+        if (!insertErr && fileRow && MATRIYA_BACK_URL && isMatriyaIngestible(relativeName)) {
+          setImmediate(() => ingestFileInBackground(fileRow.id, file.buffer, relativeName));
+        }
       }
       setProgress(i + 1, files.length, 'files');
     }
@@ -2594,6 +2611,64 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
     console.error('[SharePoint upload] route error:', e.message);
     if (uploadId) sharepointUploadProgressMap.delete(uploadId);
     if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+});
+
+/** Register uploaded paths (from direct-to-bucket upload) into project_files and trigger Matriya ingest so they can be asked on. */
+app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const paths = req.body?.paths;
+    if (!Array.isArray(paths) || paths.length === 0) {
+      return res.status(400).json({ error: 'paths array required (e.g. [{ path, name }])' });
+    }
+    if (!MATRIYA_BACK_URL) {
+      return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+    }
+    await ensureManualBucketExists();
+    const registered = [];
+    const errors = [];
+    for (const item of paths) {
+      const path = (item && item.path) ? String(item.path).trim() : '';
+      const name = (item && item.name) ? String(item.name).trim() : path.split('/').pop() || 'file';
+      if (!path) continue;
+      const storagePath = path.startsWith(MANUAL_PREFIX + '/') ? path.slice((MANUAL_PREFIX + '/').length) : path;
+      const fullStoragePath = MANUAL_PREFIX + '/' + storagePath;
+      try {
+        const { data: existing } = await supabase.from('project_files').select('id').eq('project_id', projectId).eq('storage_path', fullStoragePath).limit(1).maybeSingle();
+        if (existing) {
+          registered.push({ id: existing.id, name });
+          continue;
+        }
+        const { data: blob, error: dlErr } = await supabase.storage.from(MANUAL_BUCKET).download(storagePath);
+        if (dlErr || !blob) {
+          errors.push({ path, name, error: dlErr?.message || 'Download failed' });
+          continue;
+        }
+        const buffer = Buffer.from(await blob.arrayBuffer());
+        const { data: fileRow, error: insertErr } = await supabase.from('project_files').insert({
+          project_id: projectId,
+          original_name: name,
+          storage_path: fullStoragePath,
+          folder_display_name: null
+        }).select('id').single();
+        if (insertErr) {
+          errors.push({ path, name, error: insertErr.message });
+          continue;
+        }
+        registered.push({ id: fileRow.id, name });
+        if (isMatriyaIngestible(name)) {
+          setImmediate(() => ingestFileInBackground(fileRow.id, buffer, name));
+        }
+      } catch (e) {
+        errors.push({ path, name, error: e.message || String(e) });
+      }
+    }
+    res.status(201).json({ registered: registered.length, registered_ids: registered.map(r => r.id), errors: errors.length ? errors : undefined });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Failed to register and ingest' });
   }
 });
 
