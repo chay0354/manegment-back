@@ -31,13 +31,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
 app.set('trust proxy', 1); // Vercel sends X-Forwarded-For; required for express-rate-limit to identify clients correctly
-// Full CORS: allow any origin, all methods, all headers (so any URL can call the API)
+
+// CORS must run first so every response (including 4xx/5xx) gets headers; required for prod (Vercel)
 function corsHeaders(req, res, next) {
   const origin = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Access-Control-Allow-Credentials', origin ? 'true' : 'false');
+  res.setHeader('Access-Control-Allow-Origin', origin || 'https://manegment-front.vercel.app');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Upload-ID, X-Request-ID, Accept');
   res.setHeader('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
