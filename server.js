@@ -2760,8 +2760,20 @@ app.get('/api/rag/health', async (req, res) => {
   if (!MATRIYA_BACK_URL) return res.json({ ok: false, error: 'MATRIYA_BACK_URL not set' });
   try {
     const r = await axios.get(`${MATRIYA_BACK_URL}/health`, { timeout: 5000 }).catch(() => null);
+    if (r?.data) {
+      console.log('[RAG] health', {
+        matriya_url: MATRIYA_BACK_URL,
+        ok: true,
+        db_fingerprint: r.data.db_fingerprint,
+        collection_name: r.data.collection_name,
+        document_count: r.data.vector_db?.document_count
+      });
+    } else {
+      console.log('[RAG] health', { matriya_url: MATRIYA_BACK_URL, ok: false });
+    }
     res.json({ ok: !!r, matriya_url: MATRIYA_BACK_URL });
   } catch (e) {
+    console.log('[RAG] health error', { matriya_url: MATRIYA_BACK_URL, error: e.message });
     res.json({ ok: false, error: e.message, matriya_url: MATRIYA_BACK_URL });
   }
 });
@@ -2792,13 +2804,29 @@ app.post('/api/rag/search', async (req, res) => {
 
 app.post('/api/rag/research/run', async (req, res) => {
   if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+  const body = req.body || {};
+  console.log('[RAG] research/run request', {
+    matriya_url: MATRIYA_BACK_URL,
+    session_id: body.session_id ? 'set' : 'missing',
+    query_length: (body.query || '').length,
+    filename: body.filename || null,
+    filenames: Array.isArray(body.filenames) ? body.filenames.length : 0
+  });
   try {
     const forwardHeaders = {};
     if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization;
-    const r = await axios.post(`${MATRIYA_BACK_URL}/api/research/run`, req.body || {}, { timeout: 120000, headers: { 'Content-Type': 'application/json', ...forwardHeaders } });
+    const r = await axios.post(`${MATRIYA_BACK_URL}/api/research/run`, body, { timeout: 120000, headers: { 'Content-Type': 'application/json', ...forwardHeaders } });
+    const synthesis = r.data?.outputs?.synthesis || '';
+    const hasNoContent = /לא נמצא תוכן|אינדוקס|טרם עובדו/.test(synthesis);
+    console.log('[RAG] research/run response', {
+      status: r.status,
+      synthesis_length: synthesis.length,
+      has_no_content_message: hasNoContent,
+      snippet: synthesis.slice(0, 80)
+    });
     res.json(r.data);
   } catch (e) {
-    console.error('POST /api/rag/research/run → Matriya error:', e.code || e.message, e.response?.status);
+    console.error('[RAG] research/run Matriya error', { code: e.code, message: e.message, status: e.response?.status, matriya_url: MATRIYA_BACK_URL });
     const status = ragConnectionStatus(e);
     const message = ragConnectionErrorMessage(e);
     res.status(status).json(typeof (e.response?.data) === 'object' && e.response?.data !== null ? { ...e.response.data, error: message } : { error: message });
@@ -2807,13 +2835,15 @@ app.post('/api/rag/research/run', async (req, res) => {
 
 app.post('/api/rag/research/session', async (req, res) => {
   if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+  console.log('[RAG] research/session request', { matriya_url: MATRIYA_BACK_URL });
   try {
     const forwardHeaders = {};
     if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization;
     const r = await axios.post(`${MATRIYA_BACK_URL}/research/session`, req.body || {}, { timeout: 10000, headers: { 'Content-Type': 'application/json', ...forwardHeaders } });
+    console.log('[RAG] research/session response', { session_id: r.data?.session_id || r.data?.id || 'none' });
     res.json(r.data);
   } catch (e) {
-    console.error('POST /api/rag/research/session → Matriya error:', e.code || e.message, e.response?.status);
+    console.error('[RAG] research/session Matriya error', { code: e.code, message: e.message, status: e.response?.status, matriya_url: MATRIYA_BACK_URL });
     const status = ragConnectionStatus(e);
     const message = ragConnectionErrorMessage(e);
     res.status(status).json(typeof (e.response?.data) === 'object' && e.response?.data !== null ? { ...e.response.data, error: message } : { error: message });

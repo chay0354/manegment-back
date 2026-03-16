@@ -1,0 +1,9 @@
+# Vercel → manegment-back (management system) → Environment Variables
+# Use management DB (zqhdznwquejnkdpxsuui) – projects, project_files, storage
+
+NEXT_PUBLIC_SUPABASE_URL=https://zqhdznwquejnkdpxsuui.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpxaGR6bndxdWVqbmtkcHhzdXVpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5NDk5NjcsImV4cCI6MjA4NzUyNTk2N30.jiXIhLwbNGsDKhgQY9he66_OEuf3wbTL6HLu7i0wK_I
+SUPABASE_URL=https://zqhdznwquejnkdpxsuui.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpxaGR6bndxdWVqbmtkcHhzdXVpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTk0OTk2NywiZXhwIjoyMDg3NTI1OTY3fQ.xDFRVH62af3ZT4VXIqWRmcdobpPSS8Cf6YFXMVK3HBY
+MATRIYA_BACK_URL=https://matriya-back.vercel.app
+PORT=8001

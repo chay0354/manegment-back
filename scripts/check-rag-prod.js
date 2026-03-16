@@ -73,16 +73,23 @@ async function main() {
         const data = runRes.data;
         const synthesis = (data?.outputs?.synthesis || '').trim();
         const hasAnswer = synthesis.length > 10;
+        const isNoContentMessage =
+          /לא נמצא תוכן במערכת|אינדוקס|טרם עובדו/.test(synthesis) ||
+          /No document content was found|no content in the RAG/.test(synthesis);
         if (runRes.status === 200 && (data?.outputs || data?.run_id != null)) {
           log('[OK] Research run returned 200');
-          if (hasAnswer) {
-            log('[OK] Got synthesis text (' + synthesis.length + ' chars)');
+          if (isNoContentMessage) {
+            log('[FAIL] Answer is the "no content" message – RAG has no documents in this environment');
+            log('       Snippet: ' + synthesis.slice(0, 120) + '...');
+            results.summary.push('Research run: FAIL – RAG empty (ingest files in prod or check POSTGRES_URL/rag_documents)');
+          } else if (hasAnswer) {
+            log('[OK] Got real synthesis text (' + synthesis.length + ' chars)');
             results.summary.push('Research run: OK (answer length ' + synthesis.length + ')');
           } else {
             log('[INFO] Synthesis empty or short (rag_documents may be empty – upload files to ingest)');
             results.summary.push('Research run: OK but no content (ingest files for answers)');
           }
-          results.run = { run_id: data?.run_id, synthesis_length: synthesis.length };
+          results.run = { run_id: data?.run_id, synthesis_length: synthesis.length, is_no_content: isNoContentMessage };
         } else {
           log('[FAIL] Research run unexpected response: ' + JSON.stringify(data).slice(0, 200));
           results.summary.push('Research run: unexpected response');
