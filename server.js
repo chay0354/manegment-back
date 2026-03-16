@@ -1,10 +1,11 @@
 /**
  * Project Manager API – Express + Supabase.
- * Features: projects, tasks, milestones, documents, notes, file upload (→ Matriya), RAG (proxy to Matriya back).
+ * Features: projects, tasks, milestones, documents, notes, file upload, RAG (local management_vector in management DB).
  */
 import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
+import path from 'path';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
@@ -28,6 +29,17 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+function hasLocalRag() {
+  return !!(process.env.POSTGRES_URL || process.env.DATABASE_URL);
+}
+
+let _ragServicePromise = null;
+async function getLocalRag() {
+  if (!hasLocalRag()) return null;
+  if (!_ragServicePromise) _ragServicePromise = import('./lib/ragService.js').then(m => m.getRagService());
+  return _ragServicePromise;
+}
 
 const app = express();
 app.set('trust proxy', 1); // Vercel sends X-Forwarded-For; required for express-rate-limit to identify clients correctly
@@ -1975,25 +1987,21 @@ function isMatriyaIngestible(filename) {
   return MATRIYA_INGEST_EXTENSIONS.some(e => e.slice(1) === ext);
 }
 
-/** Run ingest in background after response sent; on failure update project_files.ingest_error */
+/** Run ingest in background (management vector DB); on failure update project_files.ingest_error */
 function ingestFileInBackground(projectFileId, buffer, originalName) {
-  if (!MATRIYA_BACK_URL) return;
+  if (!hasLocalRag()) return;
   (async () => {
     try {
-      const form = new FormData();
-      form.append('file', buffer, { filename: originalName });
-      const r = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-        timeout: 180000,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-        headers: form.getHeaders()
-      });
-      if (!r.data || !r.data.success) {
-        const errMsg = r.data?.error || 'Matriya ingestion failed';
-        await supabase.from('project_files').update({ ingest_error: errMsg }).eq('id', projectFileId);
+      const rag = await getLocalRag();
+      if (!rag) return;
+      const result = await rag.ingestBuffer(buffer, originalName);
+      if (!result.success) {
+        await supabase.from('project_files').update({ ingest_error: result.error || 'Indexing failed' }).eq('id', projectFileId);
+      } else {
+        await supabase.from('project_files').update({ ingest_error: null }).eq('id', projectFileId).then(() => {}, () => {});
       }
     } catch (e) {
-      const errMsg = e.response?.data?.error || e.message || 'Indexing failed';
+      const errMsg = e.message || 'Indexing failed';
       await supabase.from('project_files').update({ ingest_error: errMsg }).eq('id', projectFileId).then(() => {}, () => {});
     }
   })();
@@ -2031,8 +2039,8 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
   if (!SHAREPOINT_TENANT_ID || !SHAREPOINT_CLIENT_ID || !SHAREPOINT_CLIENT_SECRET) {
     return res.status(503).json({ error: 'SharePoint integration not configured (SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET)' });
   }
-  if (!MATRIYA_BACK_URL) {
-    return res.status(503).json({ error: 'MATRIYA_BACK_URL not set – cannot ingest files' });
+  if (!hasLocalRag()) {
+    return res.status(503).json({ error: 'RAG not configured – set POSTGRES_URL in .env for document indexing' });
   }
   const parsed = sharepointPullSchema.safeParse(req.body || {});
   if (!parsed.success) {
@@ -2062,6 +2070,7 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
     const files = children.filter(item => item.file != null);
     const ingested = [];
     const failed = [];
+    const rag = await getLocalRag();
     for (const item of files) {
       try {
         const contentRes = await axios.get(
@@ -2070,16 +2079,9 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
         );
         const buffer = Buffer.from(contentRes.data);
         const originalName = item.name || 'file';
-        const form = new FormData();
-        form.append('file', buffer, { filename: originalName });
-        const ingestRes = await axios.post(`${MATRIYA_BACK_URL}/ingest/file`, form, {
-          timeout: 180000,
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity,
-          headers: form.getHeaders()
-        });
-        if (!ingestRes.data?.success) {
-          failed.push({ name: originalName, error: ingestRes.data?.error || 'Ingestion failed' });
+        const ingestResult = rag ? await rag.ingestBuffer(buffer, originalName) : { success: false };
+        if (!ingestResult?.success) {
+          failed.push({ name: originalName, error: ingestResult?.error || 'Ingestion failed' });
           continue;
         }
         const { data: row, error } = await supabase.from('project_files').insert({
@@ -2125,7 +2127,7 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
     auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName }, req.requestId);
 
     res.status(201).json(row);
-    if (MATRIYA_BACK_URL && file.buffer) {
+    if (hasLocalRag() && file.buffer) {
       const buffer = Buffer.from(file.buffer);
       setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
     }
@@ -2559,7 +2561,7 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
           storage_path: fullStoragePath,
           folder_display_name: folderPath || null
         }).select('id').single();
-        if (!insertErr && fileRow && MATRIYA_BACK_URL && isMatriyaIngestible(relativeName)) {
+        if (!insertErr && fileRow && hasLocalRag() && isMatriyaIngestible(relativeName)) {
           setImmediate(() => ingestFileInBackground(fileRow.id, file.buffer, relativeName));
         }
       }
@@ -2624,8 +2626,8 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
     if (!Array.isArray(paths) || paths.length === 0) {
       return res.status(400).json({ error: 'paths array required (e.g. [{ path, name }])' });
     }
-    if (!MATRIYA_BACK_URL) {
-      return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+    if (!hasLocalRag()) {
+      return res.status(503).json({ error: 'RAG not configured – set POSTGRES_URL for document indexing' });
     }
     await ensureManualBucketExists();
     const registered = [];
@@ -2672,9 +2674,13 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
   }
 });
 
+const MANUAL_TYPO_BUCKET = 'manualy-uploded-sharepoint-files'; // typo bucket name in Supabase
 function resolveBucketAndPath(path) {
   if (path.startsWith(MANUAL_PREFIX + '/')) {
     return { bucket: MANUAL_BUCKET, storagePath: path.slice(MANUAL_PREFIX.length + 1) };
+  }
+  if (path.startsWith('manual2/')) {
+    return { bucket: MANUAL_TYPO_BUCKET, storagePath: path.slice(8) };
   }
   return { bucket: SHAREPOINT_BUCKET, storagePath: path };
 }
@@ -2708,7 +2714,7 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName, source: 'sharepoint_bucket' }, req.requestId);
 
     res.status(201).json(row);
-    if (MATRIYA_BACK_URL) {
+    if (hasLocalRag()) {
       setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
     }
   } catch (e) {
@@ -2756,98 +2762,97 @@ function ragConnectionStatus(e) {
   return status || 500;
 }
 
-app.get('/api/rag/health', async (req, res) => {
-  if (!MATRIYA_BACK_URL) return res.json({ ok: false, error: 'MATRIYA_BACK_URL not set' });
+app.get('/api/rag/files', async (req, res) => {
+  if (!hasLocalRag()) return res.json({ files: [] });
   try {
-    const r = await axios.get(`${MATRIYA_BACK_URL}/health`, { timeout: 5000 }).catch(() => null);
-    if (r?.data) {
-      console.log('[RAG] health', {
-        matriya_url: MATRIYA_BACK_URL,
-        ok: true,
-        db_fingerprint: r.data.db_fingerprint,
-        collection_name: r.data.collection_name,
-        document_count: r.data.vector_db?.document_count
-      });
-    } else {
-      console.log('[RAG] health', { matriya_url: MATRIYA_BACK_URL, ok: false });
-    }
-    res.json({ ok: !!r, matriya_url: MATRIYA_BACK_URL });
+    const rag = await getLocalRag();
+    const files = rag ? await rag.getAllFilenames() : [];
+    res.json({ files: files || [] });
   } catch (e) {
-    console.log('[RAG] health error', { matriya_url: MATRIYA_BACK_URL, error: e.message });
-    res.json({ ok: false, error: e.message, matriya_url: MATRIYA_BACK_URL });
+    console.warn('[RAG] files list error:', e.message);
+    res.json({ files: [] });
+  }
+});
+
+app.get('/api/rag/health', async (req, res) => {
+  if (!hasLocalRag()) return res.json({ ok: false, error: 'Set POSTGRES_URL for RAG (management vector DB)' });
+  try {
+    const rag = await getLocalRag();
+    const info = rag ? await rag.getCollectionInfo() : null;
+    const ok = !!info;
+    if (ok) console.log('[RAG] health', { ok: true, document_count: info.document_count });
+    else console.log('[RAG] health', { ok: false });
+    res.json({
+      ok,
+      vector_db: info ? { document_count: info.document_count, collection_name: info.collection_name, db_path: info.db_path } : null
+    });
+  } catch (e) {
+    console.log('[RAG] health error', e.message);
+    res.json({ ok: false, error: e.message });
   }
 });
 
 app.post('/api/rag/search', async (req, res) => {
-  if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+  if (!hasLocalRag()) return res.status(503).json({ error: 'Set POSTGRES_URL for RAG' });
   try {
-    const { query, n_results, session_id, stage, generate_answer, filename } = req.body || {};
-    const params = new URLSearchParams();
-    if (query) params.set('query', query);
-    if (n_results != null) params.set('n_results', n_results);
-    if (session_id) params.set('session_id', session_id);
-    if (stage) params.set('stage', stage);
-    if (generate_answer !== undefined) params.set('generate_answer', generate_answer);
-    if (filename) params.set('filename', filename);
-    const url = `${MATRIYA_BACK_URL}/search?${params.toString()}`;
-    const forwardHeaders = {};
-    if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization;
-    const r = await axios.get(url, { timeout: 60000, headers: forwardHeaders });
-    res.json(r.data);
+    const { query, n_results = 10, generate_answer, filename } = req.body || {};
+    const rag = await getLocalRag();
+    if (!rag) return res.status(503).json({ error: 'RAG not available' });
+    const filterMetadata = filename && typeof filename === 'string' && filename.trim() ? { filename: filename.trim() } : null;
+    if (generate_answer) {
+      const out = await rag.generateAnswer(query || '', n_results, filterMetadata, true);
+      return res.json({ results: out.results, answer: out.answer, context: out.context });
+    }
+    const results = await rag.search(query || '', n_results, filterMetadata);
+    res.json({ results });
   } catch (e) {
-    console.error('GET /api/rag/search → Matriya error:', e.code || e.message, e.response?.status);
-    const status = ragConnectionStatus(e);
-    const message = ragConnectionErrorMessage(e);
-    res.status(status).json(typeof (e.response?.data) === 'object' && e.response?.data !== null ? { ...e.response.data, error: message } : { error: message });
+    console.error('[RAG] search error:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
 app.post('/api/rag/research/run', async (req, res) => {
-  if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+  if (!hasLocalRag()) return res.status(503).json({ error: 'Set POSTGRES_URL for RAG' });
   const body = req.body || {};
-  console.log('[RAG] research/run request', {
-    matriya_url: MATRIYA_BACK_URL,
-    session_id: body.session_id ? 'set' : 'missing',
-    query_length: (body.query || '').length,
-    filename: body.filename || null,
-    filenames: Array.isArray(body.filenames) ? body.filenames.length : 0
-  });
+  const query = (body.query || '').trim();
+  let filenamesArray = Array.isArray(body.filenames) && body.filenames.length > 0 ? body.filenames.filter(f => typeof f === 'string' && f.trim()) : null;
+  if (!filenamesArray?.length && body.filename && typeof body.filename === 'string' && body.filename.trim()) {
+    const trimmed = body.filename.trim();
+    const base = path.basename(trimmed);
+    filenamesArray = base !== trimmed ? [trimmed, base] : [trimmed];
+  }
+  const filterMetadata = filenamesArray?.length ? { filenames: filenamesArray } : null;
+  if (!query) return res.status(400).json({ error: 'query is required' });
   try {
-    const forwardHeaders = {};
-    if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization;
-    const r = await axios.post(`${MATRIYA_BACK_URL}/api/research/run`, body, { timeout: 120000, headers: { 'Content-Type': 'application/json', ...forwardHeaders } });
-    const synthesis = r.data?.outputs?.synthesis || '';
-    const hasNoContent = /לא נמצא תוכן|אינדוקס|טרם עובדו/.test(synthesis);
-    console.log('[RAG] research/run response', {
-      status: r.status,
-      synthesis_length: synthesis.length,
-      has_no_content_message: hasNoContent,
-      snippet: synthesis.slice(0, 80)
+    const rag = await getLocalRag();
+    if (!rag) return res.status(503).json({ error: 'RAG not available' });
+    const out = await rag.generateAnswer(query, 20, filterMetadata, true);
+    let synthesis = out.answer || '';
+    if (!synthesis && (filterMetadata?.filename || filterMetadata?.filenames)) {
+      const indexedSet = new Set(await rag.getAllFilenames());
+      const requested = filenamesArray || [];
+      const notIndexed = requested.filter(f => !indexedSet.has(f));
+      if (notIndexed.length) {
+        synthesis = 'הקובץ שנבחר לא באינדוקס (פורמט לא נתמך או טרם עובד). בחר "כל הקבצים" או קובץ אחר מהרשימה.';
+      } else {
+        synthesis = 'לא נמצא תוכן במערכת עבור הקובץ שנבחר. נסה לבחור "כל הקבצים" או להריץ שוב את סקריפט האינדוקס.';
+      }
+    } else if (!synthesis) {
+      synthesis = 'לא נמצא תוכן במערכת. ייתכן שקבצים טרם עובדו (אינדוקס). וודא שהקבצים הועלו והריץ את סקריפט האינדוקס.';
+    }
+    res.json({
+      run_id: crypto.randomUUID(),
+      outputs: { synthesis, research: synthesis, analysis: synthesis },
+      justifications: []
     });
-    res.json(r.data);
   } catch (e) {
-    console.error('[RAG] research/run Matriya error', { code: e.code, message: e.message, status: e.response?.status, matriya_url: MATRIYA_BACK_URL });
-    const status = ragConnectionStatus(e);
-    const message = ragConnectionErrorMessage(e);
-    res.status(status).json(typeof (e.response?.data) === 'object' && e.response?.data !== null ? { ...e.response.data, error: message } : { error: message });
+    console.error('[RAG] research/run error:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
 app.post('/api/rag/research/session', async (req, res) => {
-  if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
-  console.log('[RAG] research/session request', { matriya_url: MATRIYA_BACK_URL });
-  try {
-    const forwardHeaders = {};
-    if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization;
-    const r = await axios.post(`${MATRIYA_BACK_URL}/research/session`, req.body || {}, { timeout: 10000, headers: { 'Content-Type': 'application/json', ...forwardHeaders } });
-    console.log('[RAG] research/session response', { session_id: r.data?.session_id || r.data?.id || 'none' });
-    res.json(r.data);
-  } catch (e) {
-    console.error('[RAG] research/session Matriya error', { code: e.code, message: e.message, status: e.response?.status, matriya_url: MATRIYA_BACK_URL });
-    const status = ragConnectionStatus(e);
-    const message = ragConnectionErrorMessage(e);
-    res.status(status).json(typeof (e.response?.data) === 'object' && e.response?.data !== null ? { ...e.response.data, error: message } : { error: message });
-  }
+  res.json({ session_id: crypto.randomUUID() });
 });
 
 // ---------- Health ----------
@@ -2871,7 +2876,7 @@ app.get('/health', async (req, res) => {
 if (!process.env.VERCEL) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Maneger API running on http://0.0.0.0:${PORT}`);
-    if (!MATRIYA_BACK_URL) console.warn('MATRIYA_BACK_URL not set – RAG features disabled');
+    if (!hasLocalRag()) console.warn('POSTGRES_URL not set – RAG (document Q&A) disabled. Set POSTGRES_URL to use management_vector.');
   });
 }
 export default app;

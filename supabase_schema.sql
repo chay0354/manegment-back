@@ -291,3 +291,29 @@ CREATE INDEX IF NOT EXISTS lab_saved_experiment_contexts_project_id_idx ON lab_s
 -- If tasks table already existed with old status constraint, run to add 'in_review':
 -- ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
 -- ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('todo', 'in_progress', 'in_review', 'done', 'cancelled'));
+
+-- ---------- RAG vector store (management-vector) ----------
+-- Requires: CREATE EXTENSION IF NOT EXISTS vector; (run once in Supabase SQL Editor)
+-- Embedding dimension 1536 = OpenAI text-embedding-ada-002
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS management_vector (
+  id TEXT PRIMARY KEY,
+  embedding vector(1536),
+  document TEXT NOT NULL,
+  metadata JSONB,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS management_vector_embedding_idx
+  ON management_vector
+  USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS management_vector_metadata_idx
+  ON management_vector
+  USING GIN (metadata);
+
+CREATE INDEX IF NOT EXISTS management_vector_metadata_filename_idx
+  ON management_vector
+  USING BTREE ((metadata->>'filename'));
