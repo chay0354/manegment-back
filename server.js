@@ -1175,11 +1175,19 @@ app.post('/api/projects/:projectId/import/experiment-excel', limiterUpload, uplo
     const projectId = req.params.projectId;
     if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded. Send multipart form with field "file".' });
     const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-    const firstSheet = wb.SheetNames[0];
-    if (!firstSheet) return res.status(400).json({ error: 'Excel file has no sheets' });
-    const ws = wb.Sheets[firstSheet];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
-    if (!rows.length) return res.status(201).json({ created: 0, updated: 0, error_count: 0, source_file_reference: req.file.originalname || 'excel' });
+    const sheetNames = wb.SheetNames || [];
+    if (!sheetNames.length) return res.status(400).json({ error: 'Excel file has no sheets' });
+    // Support multi-sheet Excel: collect rows from every sheet (with sheet + row for error reporting)
+    const rowsWithMeta = [];
+    for (const sheetName of sheetNames) {
+      const ws = wb.Sheets[sheetName];
+      if (!ws) continue;
+      const sheetRows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
+      for (let r = 0; r < sheetRows.length; r++) {
+        rowsWithMeta.push({ row: sheetRows[r], sheet: sheetName, rowIndex: r + 2 });
+      }
+    }
+    if (!rowsWithMeta.length) return res.status(201).json({ created: 0, updated: 0, error_count: 0, source_file_reference: req.file.originalname || 'excel' });
 
     const col = (obj, ...keys) => {
       for (const k of keys) {
@@ -1197,10 +1205,10 @@ app.post('/api/projects/:projectId/import/experiment-excel', limiterUpload, uplo
     let created = 0, updated = 0, errCount = 0;
     const details = { errors: [] };
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
+    for (let i = 0; i < rowsWithMeta.length; i++) {
+      const { row, sheet, rowIndex } = rowsWithMeta[i];
       const eid = col(row, 'experiment_id', 'experiment id', 'id');
-      if (!eid) { errCount++; details.errors.push({ row: i + 2, reason: 'experiment_id required' }); continue; }
+      if (!eid) { errCount++; details.errors.push({ sheet, row: rowIndex, reason: 'experiment_id required' }); continue; }
       let materials = col(row, 'materials', 'material');
       let percentages = col(row, 'percentages', 'percentage');
       if (typeof materials === 'string') {
@@ -1233,11 +1241,11 @@ app.post('/api/projects/:projectId/import/experiment-excel', limiterUpload, uplo
       if (existing) {
         payload.experiment_version = (existing.experiment_version || 0) + 1;
         const { error: upErr } = await supabase.from('lab_experiments').update(payload).eq('project_id', projectId).eq('experiment_id', payload.experiment_id);
-        if (upErr) { errCount++; details.errors.push({ row: i + 2, experiment_id: payload.experiment_id, reason: upErr.message }); continue; }
+        if (upErr) { errCount++; details.errors.push({ sheet, row: rowIndex, experiment_id: payload.experiment_id, reason: upErr.message }); continue; }
         updated++;
       } else {
         const { error: insErr } = await supabase.from('lab_experiments').insert(payload);
-        if (insErr) { errCount++; details.errors.push({ row: i + 2, experiment_id: payload.experiment_id, reason: insErr.message }); continue; }
+        if (insErr) { errCount++; details.errors.push({ sheet, row: rowIndex, experiment_id: payload.experiment_id, reason: insErr.message }); continue; }
         created++;
       }
     }
