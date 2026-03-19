@@ -140,6 +140,15 @@ CREATE TABLE IF NOT EXISTS project_chat_messages (
 );
 CREATE INDEX IF NOT EXISTS project_chat_messages_project_id_idx ON project_chat_messages(project_id);
 
+-- Per-user "last seen" for project chat (unread badge; survives reload / other devices)
+CREATE TABLE IF NOT EXISTS project_chat_last_read (
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  last_read_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01T00:00:00Z',
+  PRIMARY KEY (project_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS project_chat_last_read_user_idx ON project_chat_last_read(user_id);
+
 -- Project emails (sent via Resend + received via inbound webhook)
 CREATE TABLE IF NOT EXISTS project_emails (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -175,6 +184,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
   request_id TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+-- Existing DBs: CREATE TABLE IF NOT EXISTS does not add columns; ensure request_id exists before index.
+ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS request_id TEXT;
 CREATE INDEX IF NOT EXISTS audit_log_project_id_idx ON audit_log(project_id);
 CREATE INDEX IF NOT EXISTS audit_log_created_at_idx ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS audit_log_request_id_idx ON audit_log(request_id);
@@ -204,9 +215,7 @@ CREATE TABLE IF NOT EXISTS run_fsm_trace (
 );
 CREATE INDEX IF NOT EXISTS run_fsm_trace_run_id_idx ON run_fsm_trace(run_id);
 
--- If audit_log already exists without request_id, run:
--- ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS request_id TEXT;
--- CREATE INDEX IF NOT EXISTS audit_log_request_id_idx ON audit_log(request_id);
+-- audit_log.request_id: added above via ALTER TABLE ... IF NOT EXISTS before the index.
 -- If runs table exists, add index for pagination:
 -- CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs(project_id, created_at DESC);
 

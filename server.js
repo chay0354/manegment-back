@@ -122,7 +122,10 @@ const DEFAULT_CORS_ORIGINS = [
   'https://manegment-front.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000',
-  'http://127.0.0.1:5173'
+  'http://localhost:3001',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001'
 ];
 
 function getAllowedOrigins() {
@@ -594,6 +597,112 @@ app.post('/api/projects/:id/chat', async (req, res) => {
     }
     auditLog(projectId, user.id, user.username, 'create', 'chat_message', row.id, null, req.requestId);
     res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Unread = messages with created_at strictly after this user's last_read_at (stored in DB). */
+app.get('/api/projects/:id/chat/unread', async (req, res) => {
+  try {
+    const user = await getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const projectId = req.params.id;
+    const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const hasMembers = await projectHasMembers(projectId);
+    const access = hasMembers ? await getProjectAccess(projectId, user.id, user.username) : { canAccess: true, role: 'owner' };
+    if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
+    const { data: readRow, error: readErr } = await supabase
+      .from('project_chat_last_read')
+      .select('last_read_at')
+      .eq('project_id', projectId)
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (
+      readErr &&
+      !String(readErr.message || '').includes('does not exist') &&
+      !String(readErr.message || '').includes('relation')
+    ) {
+      throw readErr;
+    }
+    const lastRead = readRow?.last_read_at || '1970-01-01T00:00:00.000Z';
+    const { count, error } = await supabase
+      .from('project_chat_messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('project_id', projectId)
+      .gt('created_at', lastRead);
+    if (error) {
+      if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
+        return res.json({ unread: 0 });
+      }
+      throw error;
+    }
+    res.json({ unread: typeof count === 'number' ? count : 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Advance last_read_at to at least read_through (ISO) or latest message time — never moves backward. */
+app.post('/api/projects/:id/chat/read', async (req, res) => {
+  try {
+    const user = await getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'Authentication required' });
+    const projectId = req.params.id;
+    const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const hasMembers = await projectHasMembers(projectId);
+    const access = hasMembers ? await getProjectAccess(projectId, user.id, user.username) : { canAccess: true, role: 'owner' };
+    if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
+    let readThrough = (req.body && req.body.read_through) ? String(req.body.read_through).trim() : '';
+    if (!readThrough) {
+      const { data: latest, error: latestErr } = await supabase
+        .from('project_chat_messages')
+        .select('created_at')
+        .eq('project_id', projectId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (
+        latestErr &&
+        !String(latestErr.message || '').includes('does not exist') &&
+        !String(latestErr.message || '').includes('relation')
+      ) {
+        throw latestErr;
+      }
+      readThrough = (latest && latest.created_at) ? latest.created_at : new Date().toISOString();
+    }
+    const throughMs = Date.parse(readThrough);
+    if (Number.isNaN(throughMs)) return res.status(400).json({ error: 'Invalid read_through' });
+    const { data: existing, error: exErr } = await supabase
+      .from('project_chat_last_read')
+      .select('last_read_at')
+      .eq('project_id', projectId)
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (
+      exErr &&
+      !String(exErr.message || '').includes('does not exist') &&
+      !String(exErr.message || '').includes('relation')
+    ) {
+      throw exErr;
+    }
+    const existingMs = existing?.last_read_at ? Date.parse(existing.last_read_at) : 0;
+    const finalMs = Math.max(existingMs || 0, throughMs);
+    const finalIso = new Date(finalMs).toISOString();
+    const { error: upErr } = await supabase.from('project_chat_last_read').upsert(
+      { project_id: projectId, user_id: user.id, last_read_at: finalIso },
+      { onConflict: 'project_id,user_id' }
+    );
+    if (
+      upErr &&
+      (String(upErr.message || '').includes('does not exist') || String(upErr.message || '').includes('relation'))
+    ) {
+      return res.status(503).json({ error: 'Chat read state not available. Run project_chat_last_read in supabase_schema.sql.' });
+    }
+    if (upErr) throw upErr;
+    res.json({ last_read_at: finalIso });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

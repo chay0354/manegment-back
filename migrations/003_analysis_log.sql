@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS analysis_log (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
+ALTER TABLE analysis_log ADD COLUMN IF NOT EXISTS request_id TEXT;
+
 CREATE INDEX IF NOT EXISTS analysis_log_project_id_idx ON analysis_log(project_id);
 CREATE INDEX IF NOT EXISTS analysis_log_analysis_type_idx ON analysis_log(analysis_type);
 CREATE INDEX IF NOT EXISTS analysis_log_created_at_idx ON analysis_log(created_at DESC);
