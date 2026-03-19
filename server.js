@@ -13,7 +13,7 @@ import axios from 'axios';
 import FormData from 'form-data';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
-import { pdf } from 'pdf-to-img';
+/** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -2046,8 +2046,25 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
       return res.json({ text });
     }
     if (name.endsWith('.pdf')) {
-      if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY לא מוגדר. הגדר את המפתח ב־.env לחילוץ טקסט מ־PDF באמצעות AI.' });
       try {
+        /* Vercel / serverless: pdf-to-img → pdfjs-dist → DOMMatrix/canvas fail. Use pdf-parse for text layer only. */
+        if (process.env.VERCEL) {
+          const pdfParse = (await import('pdf-parse')).default;
+          const data = await pdfParse(req.file.buffer);
+          const text = String(data?.text || '')
+            .replace(/\r\n/g, '\n')
+            .trim();
+          return res.json({
+            text: text || 'לא נמצא טקסט בשכבת הטקסט של ה־PDF (ייתכן שזה סריקה בתמונה). נסה מקומית או המר ל־PDF עם טקסט.'
+          });
+        }
+
+        if (!OPENAI_API_KEY) {
+          return res.status(503).json({
+            error: 'OPENAI_API_KEY לא מוגדר. הגדר את המפתח ב־.env לחילוץ טקסט מ־PDF באמצעות AI (שימוש בתמונות עמוד).'
+          });
+        }
+        const { pdf } = await import('pdf-to-img');
         const dataUrl = `data:application/pdf;base64,${req.file.buffer.toString('base64')}`;
         const document = await pdf(dataUrl, { scale: 2 });
         const parts = [];
