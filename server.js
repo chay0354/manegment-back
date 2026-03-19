@@ -6,7 +6,6 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
-import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import { createClient } from '@supabase/supabase-js';
@@ -118,19 +117,65 @@ async function getLocalRag() {
 const app = express();
 app.set('trust proxy', 1); // Vercel sends X-Forwarded-For; required for express-rate-limit to identify clients correctly
 
-// CORS must run first so every response (including 4xx/5xx) gets headers; required for prod (Vercel)
+/** Comma-separated list in CORS_ORIGINS (Vercel env). Default includes production frontend + local dev. */
+const DEFAULT_CORS_ORIGINS = [
+  'https://manegment-front.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173'
+];
+
+function getAllowedOrigins() {
+  const raw = process.env.CORS_ORIGINS;
+  if (raw && String(raw).trim()) {
+    return String(raw)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return DEFAULT_CORS_ORIGINS;
+}
+
+function isOriginAllowed(origin, allowedList) {
+  if (!origin || typeof origin !== 'string') return false;
+  if (allowedList.includes(origin)) return true;
+  if (process.env.CORS_ALLOW_VERCEL_PREVIEWS === '1' || process.env.CORS_ALLOW_VERCEL_PREVIEWS === 'true') {
+    try {
+      const u = new URL(origin);
+      return u.protocol === 'https:' && u.hostname.endsWith('.vercel.app');
+    } catch (_) {
+      return false;
+    }
+  }
+  return false;
+}
+
+// CORS first: credentialed cross-origin requires an explicit allowlist (echo matching Origin only).
 function corsHeaders(req, res, next) {
   const origin = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', origin || 'https://manegment-front.vercel.app');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  const allowedList = getAllowedOrigins();
+  const ok = isOriginAllowed(origin, allowedList);
+
+  if (ok && origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Upload-ID, X-Request-ID, Accept');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-Upload-ID, X-Request-ID, Accept'
+  );
   res.setHeader('Access-Control-Max-Age', '86400');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  if (req.method === 'OPTIONS') {
+    if (ok && origin) return res.sendStatus(204);
+    return res.sendStatus(403);
+  }
   next();
 }
 app.use(corsHeaders);
-app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 
 // Request ID for audit (actor, entity, action, before/after, request_id)
@@ -163,6 +208,7 @@ const limiterGeneral = rateLimit({
   message: { error: 'Too many requests' },
   // Auth must not share this bucket — /me + login were competing with all other API traffic (429 on login).
   skip: (req) => {
+    if (req.method === 'OPTIONS') return true;
     const p = req.path || '';
     return p.startsWith('/api/auth');
   }
