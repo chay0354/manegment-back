@@ -14,6 +14,7 @@ import axios from 'axios';
 import FormData from 'form-data';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
+import { pdf } from 'pdf-to-img';
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
@@ -22,6 +23,79 @@ const MATRIYA_BACK_URL = (process.env.MATRIYA_BACK_URL || '').replace(/\/$/, '')
 const SHAREPOINT_TENANT_ID = process.env.SHAREPOINT_TENANT_ID || '';
 const SHAREPOINT_CLIENT_ID = process.env.SHAREPOINT_CLIENT_ID || '';
 const SHAREPOINT_CLIENT_SECRET = process.env.SHAREPOINT_CLIENT_SECRET || '';
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
+/** Verified-domain sender in Resend. Set RESEND_FROM_EMAIL (e.g. noreply@yourdomain.com). Default is sandbox only. */
+const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
+/** Optional: require ?secret= or Authorization: Bearer for POST /api/webhooks/resend-inbound */
+const RESEND_INBOUND_WEBHOOK_SECRET = (process.env.RESEND_INBOUND_WEBHOOK_SECRET || '').trim();
+/** Domain for Reply-To addresses: `<project_uuid>@DOMAIN` so replies route to the right project (Receiving must accept this address). */
+const RESEND_REPLY_DOMAIN = (process.env.RESEND_REPLY_DOMAIN || '').trim() || (RESEND_FROM_EMAIL.includes('@') ? RESEND_FROM_EMAIL.split('@').pop().trim() : '');
+/** Public base URL of this API (for inbound docs). e.g. https://your-api.vercel.app */
+const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '') || '').replace(/\/$/, '');
+/** folder_display_name for files imported from email into “Lab” */
+const LAB_EMAIL_IMPORT_FOLDER = 'Lab · email import';
+
+const UUID_IN_TEXT_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/i;
+
+/** Parse "Name <email@x.com>" or "email@x.com" → email@x.com */
+function parseEmailOnly(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  const m = raw.match(/<([^>]+)>/);
+  return (m ? m[1] : raw).trim();
+}
+
+/** Find project UUID embedded in any recipient (e.g. ec9e94e5-...@inbound.domain.com). */
+function extractProjectIdFromAddresses(addresses) {
+  if (!Array.isArray(addresses)) return null;
+  for (const a of addresses) {
+    const email = parseEmailOnly(String(a)).toLowerCase();
+    const hit = email.match(UUID_IN_TEXT_RE);
+    if (hit) return hit[1];
+    const local = email.split('@')[0] || '';
+    const hit2 = local.match(UUID_IN_TEXT_RE);
+    if (hit2) return hit2[1];
+  }
+  return null;
+}
+
+/** Resolve project UUID from inbound email: webhook ?project_id=..., To/Cc/Bcc, headers, or subject. */
+function extractProjectIdFromInboundPayload(full, query) {
+  const rawQ = query && query.project_id != null ? String(query.project_id).trim() : '';
+  if (rawQ) {
+    const m = rawQ.match(UUID_IN_TEXT_RE);
+    if (m) return m[1].toLowerCase();
+  }
+  const toList = [];
+  const push = (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (const x of arr) toList.push(typeof x === 'string' ? x : (x && String(x)));
+  };
+  push(full.to);
+  push(full.cc);
+  push(full.bcc);
+  let pid = extractProjectIdFromAddresses(toList);
+  if (pid) return pid.toLowerCase();
+  const headers = full.headers;
+  if (headers && typeof headers === 'object') {
+    try {
+      const blob = JSON.stringify(headers);
+      const m = blob.match(UUID_IN_TEXT_RE);
+      if (m) return m[1].toLowerCase();
+    } catch (_) {}
+  }
+  const subj = String(full.subject || '');
+  const m2 = subj.match(UUID_IN_TEXT_RE);
+  if (m2) return m2[1].toLowerCase();
+  return null;
+}
+
+function replyToAddressForProject(projectId) {
+  if (!projectId || !RESEND_REPLY_DOMAIN || RESEND_REPLY_DOMAIN.includes('resend.dev')) return null;
+  const id = String(projectId).trim().toLowerCase();
+  if (!UUID_IN_TEXT_RE.test(id)) return null;
+  return `${id}@${RESEND_REPLY_DOMAIN}`;
+}
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
@@ -65,8 +139,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting: auth strict, upload/chat/rag moderate, general API relaxed
-const limiterAuth = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: 'Too many auth attempts' } });
+// Login/signup only — NOT shared with /api/auth/me. Disable locally: DISABLE_AUTH_RATE_LIMIT=1
+const limiterLogin = rateLimit({
+  windowMs: 60 * 1000,
+  max: Math.min(500, Math.max(10, parseInt(process.env.AUTH_LOGIN_RATE_LIMIT_MAX, 10) || 120)),
+  message: { error: 'Too many login attempts. Wait a minute and try again.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+const skipAuthRateLimit = process.env.DISABLE_AUTH_RATE_LIMIT === '1' || process.env.DISABLE_AUTH_RATE_LIMIT === 'true';
+const limiterLoginMw = skipAuthRateLimit ? ((req, res, next) => next()) : limiterLogin;
 const limiterUpload = rateLimit({
   windowMs: 60 * 1000,
   max: parseInt(process.env.UPLOAD_RATE_LIMIT_MAX, 10) || 100,
@@ -74,8 +156,17 @@ const limiterUpload = rateLimit({
 });
 const limiterSharePoint = rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: 'Too many SharePoint pull requests' } });
 const limiterRag = rateLimit({ windowMs: 60 * 1000, max: 30, message: { error: 'Too many RAG requests' } });
-const limiterGeneral = rateLimit({ windowMs: 60 * 1000, max: 200, message: { error: 'Too many requests' } });
-app.use('/api/auth', limiterAuth);
+const limiterEmail = rateLimit({ windowMs: 60 * 1000, max: 15, message: { error: 'Too many emails. Try again later.' } });
+const limiterGeneral = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.API_RATE_LIMIT_MAX, 10) || 400,
+  message: { error: 'Too many requests' },
+  // Auth must not share this bucket — /me + login were competing with all other API traffic (429 on login).
+  skip: (req) => {
+    const p = req.path || '';
+    return p.startsWith('/api/auth');
+  }
+});
 app.use('/api/rag', limiterRag);
 app.use(limiterGeneral);
 
@@ -169,7 +260,7 @@ app.get('/api/projects/:id/access', async (req, res) => {
       }
       return res.json({ canAccess: true, role: user ? 'owner' : null, hasPendingRequest: false });
     }
-    const access = await getProjectAccess(projectId, user?.id);
+    const access = await getProjectAccess(projectId, user?.id, user?.username);
     res.json(access);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -185,7 +276,7 @@ app.get('/api/projects/:id', async (req, res) => {
     if (!data) return res.status(404).json({ error: 'Project not found' });
     const hasMembers = await projectHasMembers(projectId);
     if (!hasMembers) return res.json(data);
-    const access = await getProjectAccess(projectId, user?.id);
+    const access = await getProjectAccess(projectId, user?.id, user?.username);
     if (!access.canAccess) return res.status(403).json({ error: 'not_member', canRequest: true });
     res.json(data);
   } catch (e) {
@@ -234,7 +325,7 @@ app.post('/api/projects/:id/request', async (req, res) => {
     const projectId = req.params.id;
     const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
     if (!project) return res.status(404).json({ error: 'Project not found' });
-    const access = await getProjectAccess(projectId, user.id);
+    const access = await getProjectAccess(projectId, user.id, user.username);
     if (access.canAccess) return res.status(400).json({ error: 'Already a member' });
     if (access.hasPendingRequest) return res.status(400).json({ error: 'Request already pending' });
     await upsertUserCache(user.id, user.username);
@@ -390,6 +481,23 @@ app.delete('/api/projects/:id/members/:userId', async (req, res) => {
 });
 
 // ---------- Project chat (any member can read/write) ----------
+app.get('/api/projects/:id/chat/count', async (req, res) => {
+  try {
+    const user = await getCurrentUser(req);
+    const projectId = req.params.id;
+    const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const hasMembers = await projectHasMembers(projectId);
+    const access = hasMembers ? await getProjectAccess(projectId, user?.id, user?.username) : { canAccess: !!user, role: user ? 'owner' : null };
+    if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
+    const { count, error } = await supabase.from('project_chat_messages').select('*', { count: 'exact', head: true }).eq('project_id', projectId);
+    if (error && !String(error.message || '').includes('does not exist') && !String(error.message || '').includes('relation')) throw error;
+    res.json({ count: typeof count === 'number' ? count : 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/projects/:id/chat', async (req, res) => {
   try {
     const user = await getCurrentUser(req);
@@ -397,7 +505,7 @@ app.get('/api/projects/:id/chat', async (req, res) => {
     const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
     if (!project) return res.status(404).json({ error: 'Project not found' });
     const hasMembers = await projectHasMembers(projectId);
-    const access = hasMembers ? await getProjectAccess(projectId, user?.id) : { canAccess: !!user, role: user ? 'owner' : null };
+    const access = hasMembers ? await getProjectAccess(projectId, user?.id, user?.username) : { canAccess: !!user, role: user ? 'owner' : null };
     if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
     const { limit, offset } = parsePagination(req);
     const { data, error } = await supabase.from('project_chat_messages').select('*').eq('project_id', projectId).order('created_at', { ascending: true }).range(offset, offset + limit - 1);
@@ -421,7 +529,7 @@ app.post('/api/projects/:id/chat', async (req, res) => {
     const { data: project } = await supabase.from('projects').select('id').eq('id', projectId).single();
     if (!project) return res.status(404).json({ error: 'Project not found' });
     const hasMembers = await projectHasMembers(projectId);
-    const access = hasMembers ? await getProjectAccess(projectId, user.id) : { canAccess: true, role: 'owner' };
+    const access = hasMembers ? await getProjectAccess(projectId, user.id, user.username) : { canAccess: true, role: 'owner' };
     if (!access.canAccess) return res.status(403).json({ error: 'Access required' });
     const body = (req.body && req.body.body) ? String(req.body.body).trim() : '';
     if (!body) return res.status(400).json({ error: 'body is required' });
@@ -440,6 +548,299 @@ app.post('/api/projects/:id/chat', async (req, res) => {
     }
     auditLog(projectId, user.id, user.username, 'create', 'chat_message', row.id, null, req.requestId);
     res.status(201).json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Project emails (Resend: send + list; inbound webhook to receive) ----------
+const EMAIL_ATTACH_MAX_FILES = 15;
+const EMAIL_ATTACH_MAX_TOTAL_BYTES = 24 * 1024 * 1024; // under Resend ~40MB post-base64 limit
+const EMAIL_INLINE_ATTACH_MAX = 8;
+const EMAIL_INLINE_ONE_MAX_BYTES = 15 * 1024 * 1024;
+
+const emailSendSchema = z
+  .object({
+    to: z.union([z.string().email(), z.array(z.string().email())]),
+    subject: z.string().min(1).max(998),
+    text: z.string().max(500000).optional(),
+    html: z.string().max(500000).optional(),
+    attachment_file_ids: z.array(z.string().uuid()).max(EMAIL_ATTACH_MAX_FILES).optional(),
+    inline_attachments: z
+      .array(
+        z.object({
+          filename: z.string().min(1).max(240),
+          content_base64: z.string().min(1).max(Math.ceil(EMAIL_INLINE_ONE_MAX_BYTES * 1.4))
+        })
+      )
+      .max(EMAIL_INLINE_ATTACH_MAX)
+      .optional()
+  })
+  .superRefine((data, ctx) => {
+    const nProj = data.attachment_file_ids?.length || 0;
+    const nIn = data.inline_attachments?.length || 0;
+    if (nProj + nIn > EMAIL_ATTACH_MAX_FILES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Too many attachments (max ${EMAIL_ATTACH_MAX_FILES} combined).`,
+        path: ['attachment_file_ids']
+      });
+    }
+  });
+
+function safeEmailAttachmentFilename(name) {
+  const base = String(name || 'file')
+    .replace(/[/\\]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  return base || 'file';
+}
+
+function appendInlineAttachmentsForResend(inlineList, resendAttachments, attachmentMeta, totalBytesSoFar) {
+  let total = totalBytesSoFar;
+  for (const item of inlineList) {
+    if (resendAttachments.length >= EMAIL_ATTACH_MAX_FILES) {
+      throw new Error(`Too many attachments (max ${EMAIL_ATTACH_MAX_FILES}).`);
+    }
+    const fname = safeEmailAttachmentFilename(item.filename);
+    let buf;
+    try {
+      buf = Buffer.from(item.content_base64, 'base64');
+    } catch {
+      throw new Error(`Invalid encoding for attachment "${fname}".`);
+    }
+    if (!buf.length) throw new Error(`Empty attachment "${fname}".`);
+    if (buf.length > EMAIL_INLINE_ONE_MAX_BYTES) {
+      throw new Error(`Attachment "${fname}" is too large (max 15 MB per file).`);
+    }
+    total += buf.length;
+    if (total > EMAIL_ATTACH_MAX_TOTAL_BYTES) {
+      throw new Error('Attachments exceed maximum total size (24 MB).');
+    }
+    resendAttachments.push({
+      filename: fname,
+      content: buf.toString('base64'),
+      content_type: guessMimeFromFilename(fname)
+    });
+    attachmentMeta.push({ filename: fname, source: 'computer' });
+  }
+  return total;
+}
+const emailAttachImportSchema = z.object({
+  attachment_id: z.string().min(8),
+  destination: z.enum(['project_files', 'lab'])
+});
+
+/** Resend Inbound: after email.received, fetch full body and store under matched project (UUID in To address). */
+app.post('/api/webhooks/resend-inbound', async (req, res) => {
+  try {
+    if (RESEND_INBOUND_WEBHOOK_SECRET) {
+      const q = req.query.secret;
+      const auth = req.headers.authorization || '';
+      const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+      if (q !== RESEND_INBOUND_WEBHOOK_SECRET && bearer !== RESEND_INBOUND_WEBHOOK_SECRET) {
+        return res.status(401).json({ error: 'Invalid webhook secret' });
+      }
+    }
+    const event = req.body || {};
+    if (event.type !== 'email.received') return res.status(200).json({ ok: true, ignored: true });
+    const emailId = event.data?.email_id;
+    if (!emailId || !RESEND_API_KEY) return res.status(400).json({ error: 'Missing email_id or RESEND_API_KEY' });
+    console.info('[resend-inbound] email.received', emailId, 'project_id query =', req.query.project_id || '(none)');
+
+    const r = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}` }
+    });
+    const full = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      return res.status(502).json({ error: full.message || 'Resend receiving API error', details: full });
+    }
+
+    const toList = Array.isArray(full.to) ? full.to : [];
+    const projectId = extractProjectIdFromInboundPayload(full, req.query);
+    if (!projectId) {
+      console.warn('[resend-inbound] skipped: no_project_id', { emailId, to: toList, hint: 'Add ?project_id=<uuid> to webhook URL or put project UUID in recipient address' });
+      return res.status(200).json({ ok: true, skipped: 'no_project_id_in_recipients' });
+    }
+
+    const { data: proj } = await supabase.from('projects').select('id').eq('id', projectId).single();
+    if (!proj) {
+      console.warn('[resend-inbound] skipped: project_not_found', { projectId, emailId });
+      return res.status(200).json({ ok: true, skipped: 'project_not_found' });
+    }
+
+    const fromEmail = parseEmailOnly(String(full.from || '')) || String(full.from || '');
+    const subject = String(full.subject || '');
+    const bodyText = full.text != null ? String(full.text) : null;
+    const bodyHtml = full.html != null ? String(full.html) : null;
+    const attachments = Array.isArray(full.attachments)
+      ? full.attachments.map(a => ({
+        id: a.id,
+        filename: a.filename,
+        content_type: a.content_type,
+        content_disposition: a.content_disposition,
+        content_id: a.content_id
+      }))
+      : [];
+
+    const insertPayload = {
+      project_id: projectId,
+      direction: 'received',
+      from_email: fromEmail,
+      to_emails: toList,
+      subject,
+      body_text: bodyText,
+      body_html: bodyHtml,
+      resend_email_id: emailId,
+      sent_by_user_id: null,
+      sent_by_username: null,
+      attachments
+    };
+    const { error: insErr } = await supabase.from('project_emails').insert(insertPayload);
+    if (insErr) {
+      if (String(insErr.message || '').includes('duplicate') || insErr.code === '23505') {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+      if (String(insErr.message || '').includes('does not exist') || String(insErr.message || '').includes('relation')) {
+        return res.status(503).json({ error: 'project_emails table missing. Run supabase_schema.sql (project_emails).' });
+      }
+      throw insErr;
+    }
+    auditLog(projectId, null, 'inbound', 'create', 'project_email', emailId, { subject, from: fromEmail }, req.requestId);
+    return res.status(201).json({ ok: true, project_id: projectId });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/emails', async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    const { limit, offset } = parsePagination(req);
+    const dir = (req.query.direction || 'all').toLowerCase();
+    let q = supabase.from('project_emails').select('*', { count: 'exact' }).eq('project_id', projectId).order('created_at', { ascending: false });
+    if (dir === 'sent') q = q.eq('direction', 'sent');
+    else if (dir === 'received') q = q.eq('direction', 'received');
+    const { data, error, count } = await q.range(offset, offset + limit - 1);
+    if (error) {
+      if (String(error.message || '').includes('does not exist') || String(error.message || '').includes('relation')) {
+        return res.json({ emails: [], limit, offset, total: 0 });
+      }
+      throw error;
+    }
+    res.json({ emails: data || [], limit, offset, total: count ?? 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/projects/:projectId/emails/:emailId', async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    const { data, error } = await supabase.from('project_emails').select('*').eq('id', req.params.emailId).eq('project_id', projectId).single();
+    if (error || !data) return res.status(404).json({ error: 'Email not found' });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** Help frontend show correct Resend Inbound + Reply-To (no secrets). */
+app.get('/api/projects/:projectId/emails/inbound-config', async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    const replyTo = replyToAddressForProject(projectId);
+    const host = PUBLIC_API_BASE || '(set PUBLIC_API_BASE_URL to your public API, e.g. https://api.example.com)';
+    const webhookTemplate = `${host}/api/webhooks/resend-inbound?secret=YOUR_SECRET&project_id=${projectId}`;
+    res.json({
+      project_id: projectId,
+      reply_to_address: replyTo,
+      reply_domain: RESEND_REPLY_DOMAIN || null,
+      webhook_url_template: webhookTemplate,
+      secret_configured: !!RESEND_INBOUND_WEBHOOK_SECRET
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/emails/send', limiterEmail, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!RESEND_API_KEY) {
+      return res.status(503).json({ error: 'Email sending is not configured. Set RESEND_API_KEY on the server.' });
+    }
+    const parsed = emailSendSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { to, subject, text, html, attachment_file_ids: attachIds, inline_attachments: inlineAtt } = parsed.data;
+    if (!text && !html) return res.status(400).json({ error: 'Email body required (text or html).' });
+    const toArr = Array.isArray(to) ? to : [to];
+    const payload = { from: RESEND_FROM_EMAIL, to: toArr, subject };
+    if (text) payload.text = text;
+    if (html) payload.html = html;
+    const replyTo = replyToAddressForProject(projectId);
+    if (replyTo) payload.reply_to = [replyTo];
+    let attachmentMeta = [];
+    const resendAttachments = [];
+    let bytesUsed = 0;
+    if (attachIds && attachIds.length > 0) {
+      try {
+        const out = await projectFilesToResendAttachments(projectId.trim(), attachIds);
+        attachmentMeta = out.meta;
+        bytesUsed = out.totalBytes || 0;
+        resendAttachments.push(...out.attachments);
+      } catch (e) {
+        return res.status(400).json({ error: e.message || 'Failed to load attachments' });
+      }
+    }
+    if (inlineAtt && inlineAtt.length > 0) {
+      try {
+        bytesUsed = appendInlineAttachmentsForResend(inlineAtt, resendAttachments, attachmentMeta, bytesUsed);
+      } catch (e) {
+        return res.status(400).json({ error: e.message || 'Invalid attachments' });
+      }
+    }
+    if (resendAttachments.length) payload.attachments = resendAttachments;
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = data.message || data.error || (typeof data === 'string' ? data : 'Resend error');
+      return res.status(r.status >= 500 ? 502 : 400).json({ error: typeof msg === 'string' ? msg : 'Resend error', details: data });
+    }
+    const resendId = data.id || null;
+    const { data: row, error: insErr } = await supabase.from('project_emails').insert({
+      project_id: projectId,
+      direction: 'sent',
+      from_email: RESEND_FROM_EMAIL,
+      to_emails: toArr,
+      subject,
+      body_text: text || null,
+      body_html: html || null,
+      resend_email_id: resendId,
+      sent_by_user_id: ctx.user.id,
+      sent_by_username: ctx.user.username || null,
+      attachments: attachmentMeta.length ? attachmentMeta : []
+    }).select().single();
+    if (insErr) {
+      if (!String(insErr.message || '').includes('does not exist') && !String(insErr.message || '').includes('relation')) {
+        console.error('project_emails insert failed:', insErr);
+      }
+    }
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'email_send', resendId, { to: toArr, subject }, req.requestId);
+    res.json({ success: true, id: resendId, email: row || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -467,10 +868,11 @@ app.post('/api/projects/:projectId/tasks', async (req, res) => {
     const parsed = taskCreateSchema.safeParse(req.body || {});
     if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
     const { title, status, priority, due_date } = parsed.data;
+    const validStatus = (status && ALLOWED_TASK_STATUSES.includes(status)) ? status : 'todo';
     const { data, error } = await supabase.from('tasks').insert({
       project_id: req.params.projectId,
       title: title.trim(),
-      status: status || 'todo',
+      status: validStatus,
       priority: priority || 'medium',
       due_date: due_date || null
     }).select().single();
@@ -774,8 +1176,8 @@ function forwardAuth(method, path, req, res) {
     });
 }
 
-app.post('/api/auth/login', (req, res) => forwardAuth('POST', '/login', req, res));
-app.post('/api/auth/signup', (req, res) => forwardAuth('POST', '/signup', req, res));
+app.post('/api/auth/login', limiterLoginMw, (req, res) => forwardAuth('POST', '/login', req, res));
+app.post('/api/auth/signup', limiterLoginMw, (req, res) => forwardAuth('POST', '/signup', req, res));
 app.get('/api/auth/me', (req, res) => {
   if (!MATRIYA_BACK_URL) return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
   const url = `${MATRIYA_BACK_URL}/auth/me`;
@@ -819,8 +1221,9 @@ async function getCurrentUser(req) {
   return null;
 }
 
-async function getProjectAccess(projectId, userId) {
+async function getProjectAccess(projectId, userId, username = null) {
   if (!userId) return { canAccess: false, role: null, hasPendingRequest: false };
+  if (String(username || '').trim().toLowerCase() === 'admin') return { canAccess: true, role: 'owner', hasPendingRequest: false };
   const { data: members } = await supabase.from('project_members').select('role').eq('project_id', projectId).eq('user_id', userId).maybeSingle();
   if (members) return { canAccess: true, role: members.role, hasPendingRequest: false };
   const { data: pending } = await supabase.from('project_join_requests').select('id').eq('project_id', projectId).eq('user_id', userId).eq('status', 'pending').maybeSingle();
@@ -843,7 +1246,7 @@ async function requireProjectMember(req, res, projectId) {
     return null;
   }
   const hasMembers = await projectHasMembers(projectId);
-  const access = hasMembers ? await getProjectAccess(projectId, user.id) : { canAccess: !!user, role: user ? 'owner' : null };
+  const access = hasMembers ? await getProjectAccess(projectId, user.id, user.username) : { canAccess: !!user, role: user ? 'owner' : null };
   if (!access.canAccess) {
     res.status(403).json({ error: 'Not a project member' });
     return null;
@@ -866,14 +1269,17 @@ function auditLog(projectId, userId, username, action, entityType, entityId = nu
 }
 
 // ---------- Task status state machine (allowed transitions) ----------
+// Only three statuses in UI: todo (לביצוע), in_progress (בביצוע), done (הושלם). in_review (בדיקה) removed.
 const TASK_STATUS_TRANSITIONS = {
   todo: ['in_progress', 'cancelled'],
-  in_progress: ['todo', 'in_review', 'cancelled'],
-  in_review: ['in_progress', 'done', 'cancelled'],
+  in_progress: ['todo', 'done', 'cancelled'],
   done: [],
-  cancelled: []
+  cancelled: [],
+  in_review: ['todo', 'in_progress', 'done', 'cancelled'] // legacy: allow moving existing in_review tasks
 };
+const ALLOWED_TASK_STATUSES = ['todo', 'in_progress', 'done'];
 function isAllowedTaskStatusTransition(fromStatus, toStatus) {
+  if (!ALLOWED_TASK_STATUSES.includes(toStatus)) return false;
   const allowed = TASK_STATUS_TRANSITIONS[fromStatus];
   return Array.isArray(allowed) && allowed.includes(toStatus);
 }
@@ -1593,7 +1999,50 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
       const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim() || 'הקובץ ריק.';
       return res.json({ text });
     }
-    return res.status(400).json({ error: 'סוג קובץ לא נתמך. השתמש ב־XLSX, XLS, CSV, TXT או JSON.' });
+    if (name.endsWith('.pdf')) {
+      if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY לא מוגדר. הגדר את המפתח ב־.env לחילוץ טקסט מ־PDF באמצעות AI.' });
+      try {
+        const dataUrl = `data:application/pdf;base64,${req.file.buffer.toString('base64')}`;
+        const document = await pdf(dataUrl, { scale: 2 });
+        const parts = [];
+        let pageNum = 0;
+        const maxPages = 50;
+        for await (const image of document) {
+          pageNum++;
+          if (pageNum > maxPages) break;
+          const b64 = image.toString('base64');
+          const visionResp = await axios.post(
+            'https://api.openai.com/v1/chat/completions',
+            {
+              model: 'gpt-4o-mini',
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'text',
+                      text: 'Extract all text from this document page. Preserve order, structure, and original language (e.g. Hebrew or English). Output only the extracted text, no commentary.'
+                    },
+                    { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } }
+                  ]
+                }
+              ],
+              max_tokens: 4096,
+              temperature: 0
+            },
+            { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 60000 }
+          );
+          const pageText = (visionResp.data?.choices?.[0]?.message?.content || '').trim();
+          if (pageText) parts.push(pageText);
+        }
+        const text = parts.join('\n\n').trim() || 'הקובץ ריק או ללא טקסט.';
+        return res.json({ text });
+      } catch (pdfErr) {
+        const msg = pdfErr.response?.data?.error?.message || pdfErr.message || '';
+        return res.status(400).json({ error: 'לא ניתן לחלץ טקסט מקובץ ה־PDF באמצעות AI. ייתכן שהקובץ פגום או ש־OPENAI_API_KEY חסר/לא תקין. ' + msg });
+      }
+    }
+    return res.status(400).json({ error: 'סוג קובץ לא נתמך. השתמש ב־PDF, XLSX, XLS, CSV, TXT או JSON.' });
   } catch (e) {
     if (e.message && /corrupt|invalid|xlsx|workbook/i.test(e.message)) return res.status(400).json({ error: 'קובץ Excel פגום או בפורמט לא נתמך.' });
     res.status(500).json({ error: e.message || 'שגיאה בפענוח הקובץ.' });
@@ -1657,7 +2106,6 @@ app.delete('/api/projects/:projectId/lab/saved-experiments/:id', async (req, res
 });
 
 // ---------- Lab AI insights (OpenAI GPT) ----------
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const LAB_AI_INSIGHT_TASKS = {
   insights: { title: 'תובנות מהדאטה', instruction: 'סכם תובנות עיקריות מהנתונים: שיעור הצלחה, כישלונות, מגמות לפי תחום. תן סיכום תמציתי בעברית.' },
   contradictions: { title: 'זיהוי סתירות', instruction: 'זהה סתירות: אותה פורמולה עם תוצאות שונות. רשום כל סתירה עם מזהי הניסויים והתוצאות. אם אין – כתוב שאין סתירות. עברית.' },
@@ -1675,7 +2123,14 @@ const LAB_AI_INSIGHT_TASKS = {
 1) זהה אזורים שלא נבדקו במרחב הפורמולציות.
 2) זהה גבולות יציבות בין ניסויים מוצלחים לנכשלים.
 3) זהה קומבינציות חומרים שלא נבדקו.
-הפלט: 3–5 הצעות לניסויים. לכל הצעה כלול: פורמולציה מוצעת, ציון confidence/סיכון (confidence/risk score), והסבר קצר למה הניסוי הוצע. כל התשובה בעברית.`
+
+הפלט: 3–5 הצעות לניסויים. לכל הצעה חובה לכלול במפורש:
+• פורמולציה מוצעת
+• הסבר: הסבר קצר למה הניסוי הוצע (מה המטרה, מה הצפי)
+• Evidence (על בסיס מה ההצעה): על אילו נתונים/ניסויים קיימים ההצעה מתבססת (מזהי ניסויים, תחום, תוצאות רלוונטיות)
+• Risk (בסיסי): ציון סיכון בסיסי (נמוך/בינוני/גבוה) והסבר קצר לסיכון
+
+כל התשובה בעברית. הצג כל הצעה במבנה ברור (ממוספר או עם כותרות קטנות).`
   }
 };
 
@@ -2007,6 +2462,61 @@ function ingestFileInBackground(projectFileId, buffer, originalName) {
   })();
 }
 
+async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName, folderDisplayName, req) {
+  const name = (originalName && String(originalName).trim()) || 'file';
+  const { data: row, error: insertErr } = await supabase.from('project_files').insert({
+    project_id: projectId,
+    original_name: name,
+    folder_display_name: folderDisplayName || null
+  }).select().single();
+  if (insertErr) throw insertErr;
+  auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: name, source: 'email_attachment' }, req.requestId);
+  if (hasLocalRag() && buffer && buffer.length) {
+    setImmediate(() => ingestFileInBackground(row.id, Buffer.from(buffer), name));
+  }
+  return row;
+}
+
+/** Import an attachment from a received email into project files (RAG). destination=lab uses LAB_EMAIL_IMPORT_FOLDER. */
+app.post('/api/projects/:projectId/emails/:storedEmailId/import-attachment', limiterEmail, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!RESEND_API_KEY) return res.status(503).json({ error: 'RESEND_API_KEY required' });
+    const parsed = emailAttachImportSchema.safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: 'Validation failed', issues: parsed.error.flatten() });
+    const { attachment_id, destination } = parsed.data;
+
+    const { data: mailRow, error: mailErr } = await supabase.from('project_emails').select('*').eq('id', req.params.storedEmailId).eq('project_id', projectId).single();
+    if (mailErr || !mailRow) return res.status(404).json({ error: 'Email not found' });
+    if (mailRow.direction !== 'received') return res.status(400).json({ error: 'Only received emails can import Resend attachments' });
+    if (!mailRow.resend_email_id) return res.status(400).json({ error: 'Email has no Resend receiving id' });
+
+    const attUrl = `https://api.resend.com/emails/receiving/${encodeURIComponent(mailRow.resend_email_id)}/attachments/${encodeURIComponent(attachment_id)}`;
+    const attMetaR = await fetch(attUrl, { headers: { Authorization: `Bearer ${RESEND_API_KEY}` } });
+    const attMeta = await attMetaR.json().catch(() => ({}));
+    if (!attMetaR.ok) {
+      return res.status(502).json({ error: typeof attMeta.message === 'string' ? attMeta.message : 'Failed to get attachment from Resend', details: attMeta });
+    }
+    const downloadUrl = attMeta.download_url;
+    if (!downloadUrl) return res.status(502).json({ error: 'No download_url from Resend (URLs expire ~1h after receipt)' });
+    const binR = await fetch(downloadUrl);
+    if (!binR.ok) return res.status(502).json({ error: 'Failed to download attachment bytes' });
+    const buf = Buffer.from(await binR.arrayBuffer());
+    const filename = attMeta.filename || 'attachment';
+    const folderLabel = destination === 'lab' ? LAB_EMAIL_IMPORT_FOLDER : null;
+    const row = await createProjectFileFromBuffer(projectId, ctx, buf, filename, folderLabel, req);
+    res.status(201).json({
+      file: row,
+      ingestible: isMatriyaIngestible(filename),
+      destination
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/projects/:projectId/files', async (req, res) => {
   try {
     const projectId = req.params.projectId;
@@ -2124,12 +2634,40 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
       folder_display_name: folderDisplayName || null
     }).select().single();
     if (insertErr) throw insertErr;
-    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName }, req.requestId);
 
-    res.status(201).json(row);
-    if (hasLocalRag() && file.buffer) {
-      const buffer = Buffer.from(file.buffer);
-      setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
+    const buffer = file.buffer ? Buffer.from(file.buffer) : null;
+    let rowOut = row;
+    if (buffer && buffer.length > 0) {
+      await ensureManualBucketExists();
+      const relativeKey = `${PROJECT_PREFIX}${projectId}/${row.id}/${safeStorageKeySegment(originalName)}`;
+      const storage_path = `${MANUAL_PREFIX}/${relativeKey}`;
+      const { error: upErr } = await supabase.storage.from(MANUAL_BUCKET).upload(relativeKey, buffer, {
+        contentType: file.mimetype || 'application/octet-stream',
+        upsert: false
+      });
+      if (upErr) {
+        await supabase.from('project_files').delete().eq('id', row.id).eq('project_id', projectId);
+        throw new Error(upErr.message || 'Failed to store file in project storage');
+      }
+      const { data: updated, error: pathErr } = await supabase
+        .from('project_files')
+        .update({ storage_path })
+        .eq('id', row.id)
+        .select()
+        .single();
+      if (pathErr) {
+        await supabase.storage.from(MANUAL_BUCKET).remove([relativeKey]).catch(() => {});
+        await supabase.from('project_files').delete().eq('id', row.id).eq('project_id', projectId);
+        throw pathErr;
+      }
+      rowOut = updated || { ...row, storage_path };
+    }
+
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', rowOut.id, { original_name: originalName }, req.requestId);
+
+    res.status(201).json(rowOut);
+    if (hasLocalRag() && buffer) {
+      setImmediate(() => ingestFileInBackground(rowOut.id, buffer, originalName));
     }
   } catch (e) {
     const status = e.response?.status || 500;
@@ -2683,6 +3221,82 @@ function resolveBucketAndPath(path) {
     return { bucket: MANUAL_TYPO_BUCKET, storagePath: path.slice(8) };
   }
   return { bucket: SHAREPOINT_BUCKET, storagePath: path };
+}
+
+function guessMimeFromFilename(name) {
+  const ext = String(name || '').split('.').pop()?.toLowerCase() || '';
+  const map = {
+    pdf: 'application/pdf',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    txt: 'text/plain',
+    html: 'text/html',
+    htm: 'text/html',
+    csv: 'text/csv',
+    json: 'application/json',
+    xml: 'application/xml',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    zip: 'application/zip',
+    '7z': 'application/x-7z-compressed',
+    rar: 'application/vnd.rar'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+/**
+ * Load project_files from Supabase Storage for outbound email attachments (Resend).
+ * Only rows with non-empty storage_path work (SharePoint bucket / manual bucket paths).
+ */
+async function projectFilesToResendAttachments(projectId, fileIds) {
+  const unique = [...new Set(fileIds)];
+  if (unique.length > EMAIL_ATTACH_MAX_FILES) {
+    throw new Error(`Too many attachments (max ${EMAIL_ATTACH_MAX_FILES})`);
+  }
+  const attachments = [];
+  const meta = [];
+  let totalBytes = 0;
+  for (const fid of unique) {
+    const { data: row, error } = await supabase
+      .from('project_files')
+      .select('id, original_name, storage_path')
+      .eq('project_id', projectId)
+      .eq('id', fid)
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Database error loading file');
+    if (!row) throw new Error('Project file not found or not in this project');
+    if (!row.storage_path || !String(row.storage_path).trim()) {
+      const label = row.original_name || fid;
+      throw new Error(
+        `Cannot attach "${label}": no stored file (only documents synced to project storage can be attached to email).`
+      );
+    }
+    const { bucket, storagePath } = resolveBucketAndPath(row.storage_path);
+    const { data: blob, error: downloadError } = await supabase.storage.from(bucket).download(storagePath);
+    if (downloadError || !blob) {
+      throw new Error(`Could not read "${row.original_name || fid}": ${downloadError?.message || 'download failed'}`);
+    }
+    const buffer = Buffer.from(await blob.arrayBuffer());
+    totalBytes += buffer.length;
+    if (totalBytes > EMAIL_ATTACH_MAX_TOTAL_BYTES) {
+      throw new Error('Attachments exceed maximum total size (24 MB).');
+    }
+    const filename = row.original_name || storagePath.split('/').pop() || 'attachment';
+    attachments.push({
+      filename,
+      content: buffer.toString('base64'),
+      content_type: guessMimeFromFilename(filename)
+    });
+    meta.push({ filename, project_file_id: row.id });
+  }
+  return { attachments, meta, totalBytes };
 }
 
 app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {

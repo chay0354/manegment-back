@@ -140,6 +140,28 @@ CREATE TABLE IF NOT EXISTS project_chat_messages (
 );
 CREATE INDEX IF NOT EXISTS project_chat_messages_project_id_idx ON project_chat_messages(project_id);
 
+-- Project emails (sent via Resend + received via inbound webhook)
+CREATE TABLE IF NOT EXISTS project_emails (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  direction TEXT NOT NULL CHECK (direction IN ('sent', 'received')),
+  from_email TEXT NOT NULL DEFAULT '',
+  to_emails JSONB NOT NULL DEFAULT '[]',
+  subject TEXT NOT NULL DEFAULT '',
+  body_text TEXT,
+  body_html TEXT,
+  resend_email_id TEXT,
+  sent_by_user_id INTEGER,
+  sent_by_username TEXT,
+  attachments JSONB NOT NULL DEFAULT '[]',
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS project_emails_project_id_created_idx ON project_emails(project_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS project_emails_resend_id_uidx ON project_emails (resend_email_id) WHERE resend_email_id IS NOT NULL;
+
+-- Existing DBs created before `attachments`: CREATE TABLE IF NOT EXISTS does not add columns — run this always (no-op if column exists).
+ALTER TABLE project_emails ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]';
+
 -- Audit log (actor, entity, action, before/after, request_id)
 CREATE TABLE IF NOT EXISTS audit_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
