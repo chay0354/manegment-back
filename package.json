@@ -10,7 +10,8 @@
     "index:vector": "node scripts/index-all-files-to-management-vector.js",
     "index:vector:list": "node scripts/index-all-files-to-management-vector.js --list",
     "register:bucket": "node scripts/register-bucket-files-to-project.js",
-    "index:buckets": "node scripts/index-from-buckets-to-management-vector.js"
+    "index:buckets": "node scripts/index-from-buckets-to-management-vector.js",
+    "sync:gpt-rag-all": "node scripts/sync-all-gpt-rag.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

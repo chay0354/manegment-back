@@ -13,6 +13,7 @@ import axios from 'axios';
 import FormData from 'form-data';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
+import { syncProjectGptRagToOpenAI, buildProjectFileCatalogAppendix } from './lib/gptRagSync.js';
 /** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
@@ -23,6 +24,24 @@ const SHAREPOINT_TENANT_ID = process.env.SHAREPOINT_TENANT_ID || '';
 const SHAREPOINT_CLIENT_ID = process.env.SHAREPOINT_CLIENT_ID || '';
 const SHAREPOINT_CLIENT_SECRET = process.env.SHAREPOINT_CLIENT_SECRET || '';
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const OPENAI_API_BASE = 'https://api.openai.com/v1';
+/** Model for GPT RAG (Responses API + file_search). */
+const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
+/** Strict grounded Q&A: project files only; no general-knowledge substitution. */
+const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
+
+STRICT GROUNDING (critical):
+- Use ONLY information that appears in the results of the file_search tool for this project's vector store.
+- Do NOT use general knowledge, training data, or the web for factual answers (products, materials, ingredients, formulas, SKUs, suppliers, regulations, chemistry, Hebrew/English naming, etc.).
+- If retrieved text does not support an answer, say clearly in Hebrew that the information does not appear in the project documents (or what is missing). Never substitute an answer from memory or "typical" industry knowledge.
+
+FILE NAMES AND SOURCES:
+- The user message may list indexed document file names. Use it when they ask about a specific file or path: prioritize snippets from that document and cite its name.
+- For every substantive claim, name the supporting document(s) as shown in file_search. For cross-document questions (e.g. which products contain material X), list only facts actually stated in retrieved snippets, each with its source file.
+
+LANGUAGE: Hebrew (עברית) only unless the user explicitly asks for another language.
+
+The vector store is exclusively this user's current project — never treat content as coming from elsewhere.`;
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
 /** Verified-domain sender in Resend. Set RESEND_FROM_EMAIL (e.g. noreply@yourdomain.com). Default is sandbox only. */
 const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
@@ -112,6 +131,36 @@ async function getLocalRag() {
   if (!hasLocalRag()) return null;
   if (!_ragServicePromise) _ragServicePromise = import('./lib/ragService.js').then(m => m.getRagService());
   return _ragServicePromise;
+}
+
+/** After new files land in storage, rebuild this project’s OpenAI vector store (debounced per project). */
+const GPT_RAG_AUTO_SYNC_DEBOUNCE_MS = Math.max(
+  5000,
+  parseInt(String(process.env.GPT_RAG_AUTO_SYNC_DEBOUNCE_MS || '60000'), 10) || 60000
+);
+const gptRagAutoSyncTimers = new Map();
+
+function scheduleOpenAiVectorSyncForProject(projectId, hint = '') {
+  if (!OPENAI_API_KEY || !projectId) return;
+  const id = String(projectId);
+  const prev = gptRagAutoSyncTimers.get(id);
+  if (prev) clearTimeout(prev);
+  const t = setTimeout(() => {
+    gptRagAutoSyncTimers.delete(id);
+    syncProjectGptRagToOpenAI(supabase, id, {
+      openaiApiKey: OPENAI_API_KEY,
+      openaiBase: OPENAI_API_BASE,
+      onLog: (msg) => console.log('[gpt-rag auto-sync]', hint || id, msg)
+    })
+      .then((r) => {
+        if (r.ok) console.log('[gpt-rag auto-sync] done', id, 'uploaded=', r.uploaded, hint || '');
+        else if (r.status === 400 && String(r.error || '').toLowerCase().includes('no supported')) {
+          console.log('[gpt-rag auto-sync] skip (no eligible files)', id, hint || '');
+        } else console.warn('[gpt-rag auto-sync]', id, r.status, r.error, hint || '');
+      })
+      .catch((e) => console.warn('[gpt-rag auto-sync] exception', id, e.message, hint || ''));
+  }, GPT_RAG_AUTO_SYNC_DEBOUNCE_MS);
+  gptRagAutoSyncTimers.set(id, t);
 }
 
 const app = express();
@@ -2665,8 +2714,11 @@ function isMatriyaIngestible(filename) {
   return MATRIYA_INGEST_EXTENSIONS.some(e => e.slice(1) === ext);
 }
 
-/** Run ingest in background (management vector DB); on failure update project_files.ingest_error */
-function ingestFileInBackground(projectFileId, buffer, originalName) {
+/**
+ * Run ingest in background (management vector DB); on failure update project_files.ingest_error.
+ * On success, debounce-schedule OpenAI vector store rebuild so cloud search matches newly indexed files.
+ */
+function ingestFileInBackground(projectId, projectFileId, buffer, originalName) {
   if (!hasLocalRag()) return;
   (async () => {
     try {
@@ -2677,6 +2729,7 @@ function ingestFileInBackground(projectFileId, buffer, originalName) {
         await supabase.from('project_files').update({ ingest_error: result.error || 'Indexing failed' }).eq('id', projectFileId);
       } else {
         await supabase.from('project_files').update({ ingest_error: null }).eq('id', projectFileId).then(() => {}, () => {});
+        if (projectId) scheduleOpenAiVectorSyncForProject(projectId, 'after-local-rag-index');
       }
     } catch (e) {
       const errMsg = e.message || 'Indexing failed';
@@ -2692,6 +2745,8 @@ function ingestFileInBackground(projectFileId, buffer, originalName) {
 async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName, folderDisplayName, req, options = {}) {
   const name = (originalName && String(originalName).trim()) || 'file';
   const contentType = (options.contentType && String(options.contentType).trim()) || 'application/octet-stream';
+  const auditSource = options.auditSource || 'email_attachment';
+  const syncReasonTag = options.syncReason || 'email/buffer';
   const { data: row, error: insertErr } = await supabase.from('project_files').insert({
     project_id: projectId,
     original_name: name,
@@ -2727,10 +2782,11 @@ async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName,
     rowOut = updated || { ...row, storage_path };
   }
 
-  auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', rowOut.id, { original_name: name, source: 'email_attachment' }, req.requestId);
+  auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', rowOut.id, { original_name: name, source: auditSource }, req.requestId);
   if (hasLocalRag() && buf && buf.length) {
-    setImmediate(() => ingestFileInBackground(rowOut.id, Buffer.from(buf), name));
+    setImmediate(() => ingestFileInBackground(projectId, rowOut.id, Buffer.from(buf), name));
   }
+  if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, syncReasonTag);
   return rowOut;
 }
 
@@ -2847,7 +2903,6 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
     const files = children.filter(item => item.file != null);
     const ingested = [];
     const failed = [];
-    const rag = await getLocalRag();
     for (const item of files) {
       try {
         const contentRes = await axios.get(
@@ -2856,21 +2911,16 @@ app.post('/api/projects/:projectId/files/pull-sharepoint', limiterSharePoint, as
         );
         const buffer = Buffer.from(contentRes.data);
         const originalName = item.name || 'file';
-        const ingestResult = rag ? await rag.ingestBuffer(buffer, originalName) : { success: false };
-        if (!ingestResult?.success) {
-          failed.push({ name: originalName, error: ingestResult?.error || 'Ingestion failed' });
+        if (!buffer?.length) {
+          failed.push({ name: originalName, error: 'Empty file' });
           continue;
         }
-        const { data: row, error } = await supabase.from('project_files').insert({
-          project_id: projectId,
-          original_name: originalName
-        }).select().single();
-        if (error) {
-          failed.push({ name: originalName, error: error.message });
-          continue;
-        }
-        auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: originalName, source: 'sharepoint' }, req.requestId);
-        ingested.push({ id: row.id, original_name: originalName });
+        // Same as POST /files: persist to Supabase Storage (storage_path) so GPT sync / downloads work.
+        const rowOut = await createProjectFileFromBuffer(projectId, ctx, buffer, originalName, null, req, {
+          auditSource: 'sharepoint',
+          syncReason: 'sharepoint-pull'
+        });
+        ingested.push({ id: rowOut.id, original_name: originalName });
       } catch (e) {
         failed.push({ name: item.name || 'file', error: e.response?.data?.error ?? e.message });
       }
@@ -2934,8 +2984,9 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
 
     res.status(201).json(rowOut);
     if (hasLocalRag() && buffer) {
-      setImmediate(() => ingestFileInBackground(rowOut.id, buffer, originalName));
+      setImmediate(() => ingestFileInBackground(projectId, rowOut.id, buffer, originalName));
     }
+    if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'multipart');
   } catch (e) {
     const status = e.response?.status || 500;
     const data = e.response?.data || { error: e.message };
@@ -2953,6 +3004,90 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * Backfill storage_path for rows missing it by uploading UTF-8 text from the management RAG index (same DB as ingest).
+ * Enables GPT sync / download for legacy SharePoint-pull rows, etc.
+ */
+app.post('/api/projects/:projectId/files/repair-storage-from-rag', limiterRag, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!hasLocalRag()) {
+      return res.status(503).json({ error: 'RAG not configured – set POSTGRES_URL (or DATABASE_URL) for management vector DB' });
+    }
+    const rag = await getLocalRag();
+    if (!rag || typeof rag.getFullTextForFile !== 'function') {
+      return res.status(503).json({ error: 'RAG service cannot rebuild storage' });
+    }
+
+    const { data: rows, error } = await supabase
+      .from('project_files')
+      .select('id, original_name, storage_path')
+      .eq('project_id', projectId);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const missing = (rows || []).filter((r) => !r.storage_path || !String(r.storage_path).trim());
+    const repaired = [];
+    const failed = [];
+
+    await ensureManualBucketExists();
+
+    for (const row of missing) {
+      const name = String(row.original_name || '').trim() || 'file';
+      let text = await rag.getFullTextForFile(name);
+      if (!text) {
+        const base = path.basename(name);
+        if (base !== name) text = await rag.getFullTextForFile(base);
+      }
+      if (!text || !String(text).trim()) {
+        failed.push({ id: row.id, original_name: name, error: 'לא נמצא טקסט באינדוקס למסמך זה (שם קובץ לא תואם או טרם אונדקס)' });
+        continue;
+      }
+
+      const header = `--- שוחזר מאינדוקס המסמכים (מקור: ${name}) ---\n\n`;
+      const buffer = Buffer.from(header + text, 'utf8');
+      if (buffer.length > 32 * 1024 * 1024) {
+        failed.push({ id: row.id, original_name: name, error: 'הטקסט המשוחזר גדול מדי' });
+        continue;
+      }
+
+      try {
+        const relativeKey = `${PROJECT_PREFIX}${projectId}/${row.id}/${safeStorageKeySegment(name)}_rag_repair.txt`;
+        const storage_path = `${MANUAL_PREFIX}/${relativeKey}`;
+        const { error: upErr } = await supabase.storage.from(MANUAL_BUCKET).upload(relativeKey, buffer, {
+          contentType: 'text/plain; charset=utf-8',
+          upsert: true
+        });
+        if (upErr) throw new Error(upErr.message);
+        const { error: upRowErr } = await supabase
+          .from('project_files')
+          .update({ storage_path })
+          .eq('id', row.id)
+          .eq('project_id', projectId);
+        if (upRowErr) throw new Error(upRowErr.message);
+        repaired.push({ id: row.id, original_name: name });
+        auditLog(projectId, ctx.user.id, ctx.user.username, 'update', 'project_file', row.id, { storage_repaired_from_rag: true }, req.requestId);
+      } catch (e) {
+        failed.push({ id: row.id, original_name: name, error: e.message || String(e) });
+      }
+    }
+
+    if (repaired.length > 0) scheduleOpenAiVectorSyncForProject(projectId, 'repair-storage-from-rag');
+
+    res.json({
+      ok: true,
+      repaired_count: repaired.length,
+      failed_count: failed.length,
+      repaired,
+      failed: failed.length ? failed : undefined
+    });
+  } catch (e) {
+    console.error('[repair-storage-from-rag]', e);
+    res.status(500).json({ error: e.message || 'repair failed' });
   }
 });
 
@@ -3367,7 +3502,7 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
           folder_display_name: folderPath || null
         }).select('id').single();
         if (!insertErr && fileRow && hasLocalRag() && isMatriyaIngestible(relativeName)) {
-          setImmediate(() => ingestFileInBackground(fileRow.id, file.buffer, relativeName));
+          setImmediate(() => ingestFileInBackground(projectId, fileRow.id, file.buffer, relativeName));
         }
       }
       setProgress(i + 1, files.length, 'files');
@@ -3413,6 +3548,7 @@ app.post('/api/projects/:projectId/files/upload-to-sharepoint-bucket', limiterUp
       supabase_project: supabaseProjectRef
     };
     if (folderPath && folderId) payload.folderId = folderId;
+    if (uploaded.length > 0) scheduleOpenAiVectorSyncForProject(projectId, 'sharepoint-bulk');
     res.status(201).json(payload);
   } catch (e) {
     console.error('[SharePoint upload] route error:', e.message);
@@ -3437,6 +3573,7 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
     await ensureManualBucketExists();
     const registered = [];
     const errors = [];
+    let registerIngestNewRows = 0;
     for (const item of paths) {
       const path = (item && item.path) ? String(item.path).trim() : '';
       const name = (item && item.name) ? String(item.name).trim() : path.split('/').pop() || 'file';
@@ -3466,13 +3603,15 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
           continue;
         }
         registered.push({ id: fileRow.id, name });
+        registerIngestNewRows += 1;
         if (isMatriyaIngestible(name)) {
-          setImmediate(() => ingestFileInBackground(fileRow.id, buffer, name));
+          setImmediate(() => ingestFileInBackground(projectId, fileRow.id, buffer, name));
         }
       } catch (e) {
         errors.push({ path, name, error: e.message || String(e) });
       }
     }
+    if (registerIngestNewRows > 0) scheduleOpenAiVectorSyncForProject(projectId, 'register-ingest');
     res.status(201).json({ registered: registered.length, registered_ids: registered.map(r => r.id), errors: errors.length ? errors : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to register and ingest' });
@@ -3596,8 +3735,9 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
 
     res.status(201).json(row);
     if (hasLocalRag()) {
-      setImmediate(() => ingestFileInBackground(row.id, buffer, originalName));
+      setImmediate(() => ingestFileInBackground(projectId, row.id, buffer, originalName));
     }
+    if (row.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'from-bucket');
   } catch (e) {
     res.status(e.response?.status || 500).json({ error: e.response?.data?.error || e.message });
   }
@@ -3621,6 +3761,178 @@ app.get('/api/projects/:projectId/files/:fileId/download', async (req, res) => {
     res.send(buffer);
   } catch (e) {
     res.status(e.response?.status || 500).json({ error: e.response?.data?.error || e.message });
+  }
+});
+
+// ---------- GPT RAG (OpenAI vector stores + Responses API file_search) ----------
+function openAiJsonHeaders() {
+  return { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
+}
+
+function extractOpenAiResponsesOutputText(data) {
+  if (!data || typeof data !== 'object') return '';
+  if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
+  const out = data.output;
+  if (!Array.isArray(out)) return '';
+  const parts = [];
+  for (const item of out) {
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (c && typeof c.text === 'string' && (c.type === 'output_text' || c.type === 'text')) parts.push(c.text);
+      }
+    }
+  }
+  return parts.join('\n\n').trim();
+}
+
+/**
+ * Ensures file_search uses only this project's store: DB already maps project → vs id;
+ * OpenAI metadata.project_id must match (set on sync). Blocks wrong-project IDs in DB.
+ */
+async function verifyOpenAiVectorStoreMatchesProject(vectorStoreId, projectId) {
+  let r;
+  try {
+    r = await axios.get(`${OPENAI_API_BASE}/vector_stores/${vectorStoreId}`, {
+      headers: openAiJsonHeaders(),
+      timeout: 30000
+    });
+  } catch (e) {
+    if (e.response?.status === 404) {
+      const err = new Error('GPT vector store was deleted or is invalid. Sync project files to OpenAI again.');
+      err.statusCode = 400;
+      throw err;
+    }
+    throw e;
+  }
+  const meta = r.data?.metadata;
+  if (meta && typeof meta === 'object' && meta.project_id != null && String(meta.project_id) !== String(projectId)) {
+    const err = new Error('GPT vector store is not registered for this project. Sync again from the Documents tab.');
+    err.statusCode = 403;
+    throw err;
+  }
+}
+
+app.get('/api/projects/:projectId/gpt-rag/status', limiterRag, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!OPENAI_API_KEY) {
+      return res.json({ configured: false, openai: false, reason: 'OPENAI_API_KEY not set on server' });
+    }
+    const { data: project, error } = await supabase.from('projects').select('id, openai_vector_store_id').eq('id', projectId).single();
+    if (error || !project) return res.status(404).json({ error: 'Project not found' });
+    const vsId = project.openai_vector_store_id;
+    if (!vsId) {
+      return res.json({ configured: true, openai: true, vector_store_id: null, vector_store_status: null });
+    }
+    try {
+      const r = await axios.get(`${OPENAI_API_BASE}/vector_stores/${vsId}`, { headers: openAiJsonHeaders(), timeout: 30000 });
+      return res.json({
+        configured: true,
+        openai: true,
+        vector_store_id: vsId,
+        vector_store_status: r.data?.status || null,
+        file_counts: r.data?.file_counts || null
+      });
+    } catch (e) {
+      return res.json({
+        configured: true,
+        openai: true,
+        vector_store_id: vsId,
+        vector_store_status: 'unknown',
+        warning: e.response?.data?.error?.message || e.message
+      });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/projects/:projectId/gpt-rag/sync', limiterRag, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
+
+    const result = await syncProjectGptRagToOpenAI(supabase, projectId, {
+      openaiApiKey: OPENAI_API_KEY,
+      openaiBase: OPENAI_API_BASE
+    });
+    if (!result.ok) {
+      return res.status(result.status).json({
+        error: result.error,
+        skipped: result.skipped,
+        uploaded: result.uploaded,
+        batch_id: result.batch_id
+      });
+    }
+    res.json({
+      ok: true,
+      vector_store_id: result.vector_store_id,
+      uploaded: result.uploaded,
+      skipped: result.skipped,
+      batch_status: result.batch_status
+    });
+  } catch (e) {
+    console.error('[gpt-rag/sync]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.error?.message || e.message || 'Sync failed' });
+  }
+});
+
+app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
+    const q = (req.body && String(req.body.query || '').trim()) || '';
+    if (!q) return res.status(400).json({ error: 'query is required' });
+
+    const { data: project, error } = await supabase.from('projects').select('openai_vector_store_id').eq('id', projectId).single();
+    if (error || !project) return res.status(404).json({ error: 'Project not found' });
+    const vsId = project.openai_vector_store_id;
+    if (!vsId) return res.status(400).json({ error: 'No GPT vector store yet. Sync project files to OpenAI from the Documents tab first.' });
+
+    try {
+      await verifyOpenAiVectorStoreMatchesProject(vsId, projectId);
+    } catch (verErr) {
+      const st = verErr.statusCode || 500;
+      return res.status(st).json({ error: verErr.message || 'Vector store verification failed' });
+    }
+
+    const { data: catalogRows } = await supabase
+      .from('project_files')
+      .select('original_name, storage_path')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(200);
+    const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
+
+    // Single vector store for this project only (sync uploads only project_files for this project_id).
+    const payload = {
+      model: OPENAI_RAG_MODEL,
+      instructions: GPT_RAG_QUERY_INSTRUCTIONS,
+      input: q + catalogAppendix,
+      tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: 24 }],
+      include: ['file_search_call.results']
+    };
+
+    const r = await axios.post(`${OPENAI_API_BASE}/responses`, payload, {
+      headers: openAiJsonHeaders(),
+      timeout: 120000
+    });
+
+    const text = extractOpenAiResponsesOutputText(r.data);
+    res.json({
+      run_id: r.data?.id || crypto.randomUUID(),
+      outputs: { synthesis: text, research: text, analysis: text },
+      justifications: []
+    });
+  } catch (e) {
+    console.error('[gpt-rag/query]', e.response?.data || e.message);
+    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message || 'Query failed' });
   }
 });
 

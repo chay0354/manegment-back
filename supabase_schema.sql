@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS projects (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- OpenAI File Search (vector store id per project). Run if the column is missing:
+-- ALTER TABLE projects ADD COLUMN IF NOT EXISTS openai_vector_store_id TEXT;
+
 -- Tasks (per project)
 CREATE TABLE IF NOT EXISTS tasks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,11 +73,13 @@ CREATE TABLE IF NOT EXISTS project_files (
   storage_path TEXT,
   ingest_error TEXT,
   folder_display_name TEXT,
-  created_at TIMESTAMPTZ DEFAULT now()
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
 );
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS storage_path TEXT;
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS ingest_error TEXT;
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS folder_display_name TEXT;
+ALTER TABLE project_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS project_files_project_id_idx ON project_files(project_id);
 
@@ -348,3 +353,7 @@ CREATE INDEX IF NOT EXISTS management_vector_metadata_idx
 CREATE INDEX IF NOT EXISTS management_vector_metadata_filename_idx
   ON management_vector
   USING BTREE ((metadata->>'filename'));
+
+-- GPT RAG (optional):
+-- ALTER TABLE projects ADD COLUMN IF NOT EXISTS openai_vector_store_id TEXT;
+
