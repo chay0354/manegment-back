@@ -830,13 +830,17 @@ app.post('/api/webhooks/resend-inbound', async (req, res) => {
     const bodyText = full.text != null ? String(full.text) : null;
     const bodyHtml = full.html != null ? String(full.html) : null;
     const attachments = Array.isArray(full.attachments)
-      ? full.attachments.map(a => ({
-        id: a.id,
-        filename: a.filename,
-        content_type: a.content_type,
-        content_disposition: a.content_disposition,
-        content_id: a.content_id
-      }))
+      ? full.attachments.map(a => {
+        const id = a.id || a.attachment_id || a.attachmentId;
+        return {
+          id,
+          attachment_id: id,
+          filename: a.filename,
+          content_type: a.content_type,
+          content_disposition: a.content_disposition,
+          content_id: a.content_id
+        };
+      })
       : [];
 
     const insertPayload = {
@@ -2634,19 +2638,53 @@ function ingestFileInBackground(projectFileId, buffer, originalName) {
   })();
 }
 
-async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName, folderDisplayName, req) {
+/**
+ * Create project_files row and store bytes in Supabase Storage (same layout as POST /files).
+ * Without storage_path, downloads / attach-from-project / lab import-from-file do not work.
+ */
+async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName, folderDisplayName, req, options = {}) {
   const name = (originalName && String(originalName).trim()) || 'file';
+  const contentType = (options.contentType && String(options.contentType).trim()) || 'application/octet-stream';
   const { data: row, error: insertErr } = await supabase.from('project_files').insert({
     project_id: projectId,
     original_name: name,
     folder_display_name: folderDisplayName || null
   }).select().single();
   if (insertErr) throw insertErr;
-  auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', row.id, { original_name: name, source: 'email_attachment' }, req.requestId);
-  if (hasLocalRag() && buffer && buffer.length) {
-    setImmediate(() => ingestFileInBackground(row.id, Buffer.from(buffer), name));
+
+  let rowOut = row;
+  const buf = buffer && Buffer.isBuffer(buffer) ? buffer : buffer ? Buffer.from(buffer) : null;
+  if (buf && buf.length > 0) {
+    await ensureManualBucketExists();
+    const relativeKey = `${PROJECT_PREFIX}${projectId}/${row.id}/${safeStorageKeySegment(name)}`;
+    const storage_path = `${MANUAL_PREFIX}/${relativeKey}`;
+    const { error: upErr } = await supabase.storage.from(MANUAL_BUCKET).upload(relativeKey, buf, {
+      contentType,
+      upsert: false
+    });
+    if (upErr) {
+      await supabase.from('project_files').delete().eq('id', row.id).eq('project_id', projectId);
+      throw new Error(upErr.message || 'Failed to store file in project storage');
+    }
+    const { data: updated, error: pathErr } = await supabase
+      .from('project_files')
+      .update({ storage_path })
+      .eq('id', row.id)
+      .select()
+      .single();
+    if (pathErr) {
+      await supabase.storage.from(MANUAL_BUCKET).remove([relativeKey]).catch(() => {});
+      await supabase.from('project_files').delete().eq('id', row.id).eq('project_id', projectId);
+      throw pathErr;
+    }
+    rowOut = updated || { ...row, storage_path };
   }
-  return row;
+
+  auditLog(projectId, ctx.user.id, ctx.user.username, 'create', 'project_file', rowOut.id, { original_name: name, source: 'email_attachment' }, req.requestId);
+  if (hasLocalRag() && buf && buf.length) {
+    setImmediate(() => ingestFileInBackground(rowOut.id, Buffer.from(buf), name));
+  }
+  return rowOut;
 }
 
 /** Import an attachment from a received email into project files (RAG). destination=lab uses LAB_EMAIL_IMPORT_FOLDER. */
@@ -2678,7 +2716,8 @@ app.post('/api/projects/:projectId/emails/:storedEmailId/import-attachment', lim
     const buf = Buffer.from(await binR.arrayBuffer());
     const filename = attMeta.filename || 'attachment';
     const folderLabel = destination === 'lab' ? LAB_EMAIL_IMPORT_FOLDER : null;
-    const row = await createProjectFileFromBuffer(projectId, ctx, buf, filename, folderLabel, req);
+    const ct = attMeta.content_type || attMeta.contentType || 'application/octet-stream';
+    const row = await createProjectFileFromBuffer(projectId, ctx, buf, filename, folderLabel, req, { contentType: ct });
     res.status(201).json({
       file: row,
       ingestible: isMatriyaIngestible(filename),
