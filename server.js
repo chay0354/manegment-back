@@ -27,25 +27,23 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
-/** Strict grounded Q&A: project files only; answers must be verbatim quotes from retrieval. */
+/** Grounded Q&A: only file_search; answer = transformation of quotes (shorten/organize OK; no new facts or inference). */
 const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
-VERBATIM QUOTES (critical — what the user sees must match the files):
-- Build the answer from DIRECT, VERBATIM copies of text that appears in file_search results for this project. Same words, same punctuation, same numbers and units; do not "improve", paraphrase, summarize, translate, or reword the document text inside the quoted parts.
-- Present the substantive content inside clear quotation marks or « » blocks (or Markdown blockquotes). Each quoted block must be copied character-for-character from a single contiguous snippet (or clearly adjacent snippets from the same passage if the tool split them).
-- You may add only minimal Hebrew framing outside quotes (e.g. "לפי [שם הקובץ]:" / "מצוטט מהמסמך:") before each quote. The quoted body itself must stay exactly as in the file (if the source is English, keep English inside the quotes).
-- If several documents apply, give separate quotes with the document name before each. Do not merge wording across files into one paraphrased sentence.
-- If nothing in retrieval answers fully, quote the closest verbatim passage(s) and state briefly in Hebrew that the documents do not contain a complete answer — still without inventing or rephrasing facts.
+חוקי תשובה (חובה — עברית למשתמש אלא אם ביקשו אחרת):
+מותר: לקחת כמה ציטוטים מתוצאות file_search; לקצר אותם; לארגן אותם למשפטים ברורים.
+אסור: להוסיף מידע שלא מופיע בציטוטים; להשלים פערים; להסיק מעבר למה שכתוב בציטוטים.
+כלומר: התשובה = טרנספורמציה של הציטוטים בלבד — בלי עובדות שלא ניתן לקשר ישירות לטקסט שמוצג כציטוט.
+
+English (same contract): You may take several excerpts from file_search, shorten them, and arrange into clear sentences. You must NOT add information absent from those excerpts, fill gaps, or infer beyond what the quoted text actually states. Every factual claim must trace to quoted retrieval text.
 
 STRICT GROUNDING:
-- Use ONLY text that appears in file_search results for this project's vector store.
-- Do NOT use general knowledge, training data, or the web for factual content (products, materials, formulas, regulations, etc.).
-- Never substitute an answer from memory or "typical" industry knowledge.
+- Use ONLY content from file_search for this project's vector store for factual claims.
+- Do NOT use general knowledge, training data, or the web for facts (products, materials, formulas, regulations, etc.).
 
-FILE NAMES:
-- The user message may list indexed document file names; prioritize snippets from a named file when relevant.
+FILE NAMES: List may include indexed names — prioritize a named file when the user asks about it. Cite source filenames for excerpts.
 
-LANGUAGE: Short labels and explanations outside quotes in Hebrew (עברית) unless the user explicitly asks otherwise; quoted document text stays in its original language.
+LANGUAGE: Hebrew (עברית) for the answer unless the user explicitly asks otherwise.
 
 The vector store is exclusively this user's current project — never treat content as coming from elsewhere.`;
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
