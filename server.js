@@ -3769,6 +3769,14 @@ function openAiJsonHeaders() {
   return { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
 }
 
+function openAiVectorStoreHeaders() {
+  return {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+    'OpenAI-Beta': 'assistants=v2'
+  };
+}
+
 function extractOpenAiResponsesOutputText(data) {
   if (!data || typeof data !== 'object') return '';
   if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
@@ -3817,22 +3825,72 @@ function collectFileSearchSnippetsFromResponse(data) {
 }
 
 const GPT_RAG_SOURCE_EXCERPT_MAX = 4000;
+const GPT_RAG_SOURCES_UI_MAX = 6;
 
-function dedupeAndCapSources(snippets) {
+function tokenizeGptRagEvidence(text) {
+  if (!text || typeof text !== 'string') return [];
+  return text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((t) => t.length >= 2)
+    .slice(0, 80);
+}
+
+function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
+  let s = 0;
+  for (const t of queryToks) {
+    if (t.length >= 2 && snippetLower.includes(t)) s += 2;
+  }
+  for (const t of answerToks) {
+    if (t.length >= 3 && snippetLower.includes(t)) s += 1;
+  }
+  return s;
+}
+
+/** Dedupe, rank by overlap with user query and model answer, cap for UI (same idea as matriya-back). */
+function dedupeAndCapSources(snippets, query = '', answerText = '', maxItems = GPT_RAG_SOURCES_UI_MAX) {
+  const cap = Math.max(1, maxItems);
+  const list = Array.isArray(snippets) ? snippets : [];
   const seen = new Set();
-  const out = [];
-  for (const s of snippets) {
-    const key = `${s.filename}\0${s.text.slice(0, 120)}`;
+  const deduped = [];
+  let ord = 0;
+  for (const s of list) {
+    const fn = String(s.filename || 'Unknown');
+    const raw = String(s.text || '').trim();
+    if (!raw) continue;
+    const key = `${fn}\0${raw.slice(0, 120)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const excerpt =
-      s.text.length > GPT_RAG_SOURCE_EXCERPT_MAX
-        ? `${s.text.slice(0, GPT_RAG_SOURCE_EXCERPT_MAX)}…`
-        : s.text;
-    out.push({ filename: s.filename, excerpt });
-    if (out.length >= 24) break;
+    deduped.push({ filename: fn, text: raw, _i: ord++ });
   }
-  return out;
+  const qt = tokenizeGptRagEvidence(query);
+  const at = tokenizeGptRagEvidence(answerText).slice(0, 50);
+  let picked;
+  if (qt.length === 0 && at.length === 0) {
+    picked = deduped.slice(0, cap);
+  } else {
+    const scored = deduped.map((row) => ({
+      ...row,
+      sc: scoreGptRagSnippet(row.text.toLowerCase(), qt, at)
+    }));
+    scored.sort((a, b) => b.sc - a.sc || a._i - b._i);
+    const best = scored[0]?.sc ?? 0;
+    if (best <= 0) {
+      picked = deduped.slice(0, cap);
+    } else {
+      const floor = Math.max(1, best * 0.35);
+      const strong = scored.filter((x) => x.sc >= floor);
+      const pool = strong.length ? strong : scored;
+      picked = pool.slice(0, cap);
+    }
+  }
+  return picked.map((row) => {
+    const excerpt =
+      row.text.length > GPT_RAG_SOURCE_EXCERPT_MAX
+        ? `${row.text.slice(0, GPT_RAG_SOURCE_EXCERPT_MAX)}…`
+        : row.text;
+    return { filename: row.filename, excerpt };
+  });
 }
 
 /**
@@ -3843,7 +3901,7 @@ async function verifyOpenAiVectorStoreMatchesProject(vectorStoreId, projectId) {
   let r;
   try {
     r = await axios.get(`${OPENAI_API_BASE}/vector_stores/${vectorStoreId}`, {
-      headers: openAiJsonHeaders(),
+      headers: openAiVectorStoreHeaders(),
       timeout: 30000
     });
   } catch (e) {
@@ -3877,7 +3935,7 @@ app.get('/api/projects/:projectId/gpt-rag/status', limiterRag, async (req, res) 
       return res.json({ configured: true, openai: true, vector_store_id: null, vector_store_status: null });
     }
     try {
-      const r = await axios.get(`${OPENAI_API_BASE}/vector_stores/${vsId}`, { headers: openAiJsonHeaders(), timeout: 30000 });
+      const r = await axios.get(`${OPENAI_API_BASE}/vector_stores/${vsId}`, { headers: openAiVectorStoreHeaders(), timeout: 30000 });
       return res.json({
         configured: true,
         openai: true,
@@ -3922,6 +3980,7 @@ app.post('/api/projects/:projectId/gpt-rag/sync', limiterRag, async (req, res) =
       ok: true,
       vector_store_id: result.vector_store_id,
       uploaded: result.uploaded,
+      incremental: Boolean(result.incremental),
       skipped: result.skipped,
       batch_status: result.batch_status
     });
@@ -3976,7 +4035,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
 
     const text = extractOpenAiResponsesOutputText(r.data);
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
-    const sources = dedupeAndCapSources(rawSnippets);
+    const sources = dedupeAndCapSources(rawSnippets, q, text);
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
       outputs: { synthesis: text, research: text, analysis: text },

@@ -80,6 +80,8 @@ ALTER TABLE project_files ADD COLUMN IF NOT EXISTS storage_path TEXT;
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS ingest_error TEXT;
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS folder_display_name TEXT;
 ALTER TABLE project_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+ALTER TABLE project_files ADD COLUMN IF NOT EXISTS openai_file_id TEXT;
+ALTER TABLE project_files ADD COLUMN IF NOT EXISTS openai_synced_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS project_files_project_id_idx ON project_files(project_id);
 
