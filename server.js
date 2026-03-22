@@ -37,6 +37,12 @@ const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
 English (same contract): You may take several excerpts from file_search, shorten them, and arrange into clear sentences. You must NOT add information absent from those excerpts, fill gaps, or infer beyond what the quoted text actually states. Every factual claim must trace to quoted retrieval text.
 
+שאלות כלליות (חובה — למשל «על מה המסמך מדבר», מה נושא המסמך, סיכום כללי):
+- זו לא דרישה לעובדה נקודתית אחת: חייבים לענות — לקחת מספר ציטוטים מ-file_search ולבנות מהם תיאור כללי או סיכום של המסמך.
+- הסיכום הוא «מבוסס מקור» בלבד: כל פסקה או טענה בו חייבת להישען ישירות על תוכן הציטוטים; אסור להוסיף נושאים, פרטים או מסקנות שלא עולים מהציטוטים (לא השלמות, לא הסקות מעבר לטקסט).
+
+GENERAL / OVERVIEW questions (e.g. what the document is about, main theme): You must answer by combining several retrieved excerpts into a clear high-level description or summary. This is required and allowed — it is source-based synthesis, not a single data-point reply. Still: no themes or details not clearly supported by those excerpts.
+
 STRICT GROUNDING:
 - Use ONLY content from file_search for this project's vector store for factual claims.
 - Do NOT use general knowledge, training data, or the web for facts (products, materials, formulas, regulations, etc.).
