@@ -27,19 +27,25 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
-/** Strict grounded Q&A: project files only; no general-knowledge substitution. */
+/** Strict grounded Q&A: project files only; answers must be verbatim quotes from retrieval. */
 const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
-STRICT GROUNDING (critical):
-- Use ONLY information that appears in the results of the file_search tool for this project's vector store.
-- Do NOT use general knowledge, training data, or the web for factual answers (products, materials, ingredients, formulas, SKUs, suppliers, regulations, chemistry, Hebrew/English naming, etc.).
-- If retrieved text does not support an answer, say clearly in Hebrew that the information does not appear in the project documents (or what is missing). Never substitute an answer from memory or "typical" industry knowledge.
+VERBATIM QUOTES (critical — what the user sees must match the files):
+- Build the answer from DIRECT, VERBATIM copies of text that appears in file_search results for this project. Same words, same punctuation, same numbers and units; do not "improve", paraphrase, summarize, translate, or reword the document text inside the quoted parts.
+- Present the substantive content inside clear quotation marks or « » blocks (or Markdown blockquotes). Each quoted block must be copied character-for-character from a single contiguous snippet (or clearly adjacent snippets from the same passage if the tool split them).
+- You may add only minimal Hebrew framing outside quotes (e.g. "לפי [שם הקובץ]:" / "מצוטט מהמסמך:") before each quote. The quoted body itself must stay exactly as in the file (if the source is English, keep English inside the quotes).
+- If several documents apply, give separate quotes with the document name before each. Do not merge wording across files into one paraphrased sentence.
+- If nothing in retrieval answers fully, quote the closest verbatim passage(s) and state briefly in Hebrew that the documents do not contain a complete answer — still without inventing or rephrasing facts.
 
-FILE NAMES AND SOURCES:
-- The user message may list indexed document file names. Use it when they ask about a specific file or path: prioritize snippets from that document and cite its name.
-- For every substantive claim, name the supporting document(s) as shown in file_search. For cross-document questions (e.g. which products contain material X), list only facts actually stated in retrieved snippets, each with its source file.
+STRICT GROUNDING:
+- Use ONLY text that appears in file_search results for this project's vector store.
+- Do NOT use general knowledge, training data, or the web for factual content (products, materials, formulas, regulations, etc.).
+- Never substitute an answer from memory or "typical" industry knowledge.
 
-LANGUAGE: Hebrew (עברית) only unless the user explicitly asks for another language.
+FILE NAMES:
+- The user message may list indexed document file names; prioritize snippets from a named file when relevant.
+
+LANGUAGE: Short labels and explanations outside quotes in Hebrew (עברית) unless the user explicitly asks otherwise; quoted document text stays in its original language.
 
 The vector store is exclusively this user's current project — never treat content as coming from elsewhere.`;
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
