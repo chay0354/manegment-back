@@ -3785,6 +3785,56 @@ function extractOpenAiResponsesOutputText(data) {
   return parts.join('\n\n').trim();
 }
 
+/** From Responses API when `include: ['file_search_call.results']` — evidence for UI quotes. */
+function collectFileSearchSnippetsFromResponse(data) {
+  const chunks = [];
+  const out = data?.output;
+  if (!Array.isArray(out)) return chunks;
+  for (const item of out) {
+    if (item.type !== 'file_search_call') continue;
+    const results = item.results || item.search_results || item.content || [];
+    const list = Array.isArray(results) ? results : [];
+    for (const r of list) {
+      const text =
+        (typeof r === 'string' && r) ||
+        r.text ||
+        r.content ||
+        r.chunk ||
+        r.snippet ||
+        '';
+      const fname =
+        r.filename ||
+        r.file_name ||
+        (r.file && (r.file.filename || r.file.name)) ||
+        r.name ||
+        'Unknown';
+      if (text && String(text).trim()) {
+        chunks.push({ filename: String(fname), text: String(text).trim() });
+      }
+    }
+  }
+  return chunks;
+}
+
+const GPT_RAG_SOURCE_EXCERPT_MAX = 4000;
+
+function dedupeAndCapSources(snippets) {
+  const seen = new Set();
+  const out = [];
+  for (const s of snippets) {
+    const key = `${s.filename}\0${s.text.slice(0, 120)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const excerpt =
+      s.text.length > GPT_RAG_SOURCE_EXCERPT_MAX
+        ? `${s.text.slice(0, GPT_RAG_SOURCE_EXCERPT_MAX)}…`
+        : s.text;
+    out.push({ filename: s.filename, excerpt });
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+
 /**
  * Ensures file_search uses only this project's store: DB already maps project → vs id;
  * OpenAI metadata.project_id must match (set on sync). Blocks wrong-project IDs in DB.
@@ -3925,10 +3975,13 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     });
 
     const text = extractOpenAiResponsesOutputText(r.data);
+    const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
+    const sources = dedupeAndCapSources(rawSnippets);
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
       outputs: { synthesis: text, research: text, analysis: text },
-      justifications: []
+      justifications: [],
+      sources
     });
   } catch (e) {
     console.error('[gpt-rag/query]', e.response?.data || e.message);
