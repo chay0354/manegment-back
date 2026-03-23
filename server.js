@@ -14,6 +14,7 @@ import FormData from 'form-data';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
 import { syncProjectGptRagToOpenAI, buildProjectFileCatalogAppendix } from './lib/gptRagSync.js';
+import { RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE } from './lib/ragService.js';
 /** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
@@ -51,7 +52,10 @@ FILE NAMES: List may include indexed names — prioritize a named file when the 
 
 LANGUAGE: Hebrew (עברית) for the answer unless the user explicitly asks otherwise.
 
-The vector store is exclusively this user's current project — never treat content as coming from elsewhere.`;
+The vector store is exclusively this user's current project — never treat content as coming from elsewhere.
+
+FAIL-SAFE (deterministic): If file_search returns no usable excerpt text, respond with this single Hebrew sentence only — no bullet lists, no recommendations, no next steps, no "however" or alternatives:
+אין במערכת מידע תומך לשאלה זו.`;
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
 /** Verified-domain sender in Resend. Set RESEND_FROM_EMAIL (e.g. noreply@yourdomain.com). Default is sandbox only. */
 const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
@@ -1734,6 +1738,78 @@ function validateExperimentForSync(exp) {
   return err;
 }
 
+function normalizeMaterialsArray(materials) {
+  if (!Array.isArray(materials)) return [];
+  return materials
+    .map((m) => (typeof m === 'string' ? m.trim() : m && m.name != null ? String(m.name).trim() : ''))
+    .filter(Boolean);
+}
+
+/** Parse formulation save body: formula, domain/technology_domain, materials[], percentages{}. */
+function extractFormulationPayloadFromBody(body) {
+  const formulaRaw = body.formula != null ? String(body.formula).trim() : '';
+  const domain =
+    (body.technology_domain != null && String(body.technology_domain).trim()) ||
+    (body.domain != null && String(body.domain).trim()) ||
+    'unknown';
+  let materials = body.materials;
+  let percentages = body.percentages;
+  if (typeof materials === 'string') {
+    try {
+      materials = JSON.parse(materials);
+    } catch (_) {
+      materials = [];
+    }
+  }
+  if (typeof percentages === 'string') {
+    try {
+      percentages = JSON.parse(percentages);
+    } catch (_) {
+      percentages = {};
+    }
+  }
+  if (!Array.isArray(materials) && materials && typeof materials === 'object') {
+    materials = Object.keys(materials);
+  } else if (!Array.isArray(materials)) {
+    materials = [];
+  }
+  if (!percentages || typeof percentages !== 'object') percentages = {};
+  return {
+    formula: formulaRaw || null,
+    technology_domain: domain,
+    materials: normalizeMaterialsArray(materials),
+    percentages
+  };
+}
+
+/** Ordered rows for experiment_materials + consolidated material name list for lab_experiments.materials. */
+function materialRowsForExperiment(materialNames, percentages) {
+  const pctMap = {};
+  for (const [k, v] of Object.entries(percentages || {})) {
+    const n = parseFloat(v);
+    pctMap[String(k).trim().toLowerCase()] = Number.isNaN(n) ? null : n;
+  }
+  const names = [];
+  const seen = new Set();
+  for (const name of materialNames) {
+    const n = String(name).trim();
+    if (!n || seen.has(n.toLowerCase())) continue;
+    seen.add(n.toLowerCase());
+    names.push(n);
+  }
+  for (const k of Object.keys(percentages || {})) {
+    const n = String(k).trim();
+    if (!n || seen.has(n.toLowerCase())) continue;
+    seen.add(n.toLowerCase());
+    names.push(n);
+  }
+  return names.map((material_name, sort_order) => ({
+    material_name,
+    weight_percent: pctMap[material_name.toLowerCase()] ?? null,
+    sort_order
+  }));
+}
+
 app.get('/api/projects/:projectId/import/log', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
@@ -1915,6 +1991,132 @@ app.get('/api/projects/:projectId/experiments', async (req, res) => {
   }
 });
 
+/**
+ * Save extracted formulation as a lab experiment (results optional — stored as draft: partial outcome).
+ * Inserts/updates lab_experiments and replaces experiment_materials rows.
+ * Requires table experiment_materials (see sql/create_experiment_materials.sql).
+ */
+app.post('/api/projects/:projectId/experiments/from-formulation', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const body = req.body || {};
+    const ex = extractFormulationPayloadFromBody(body);
+    const hasFormula = Boolean(ex.formula && String(ex.formula).trim());
+    const hasMats = ex.materials.length > 0;
+    const hasPct = Object.keys(ex.percentages).length > 0;
+    if (!hasFormula && !hasMats && !hasPct) {
+      return res.status(400).json({
+        error: 'נדרש לפחות אחד: פורמולה, רשימת חומרים, או אחוזים (formula / materials / percentages)'
+      });
+    }
+
+    const matRowsMeta = materialRowsForExperiment(ex.materials, ex.percentages);
+    const materialsForLab = matRowsMeta.map((r) => r.material_name);
+
+    let experiment_id = body.experiment_id != null ? String(body.experiment_id).trim() : '';
+    if (!experiment_id) {
+      experiment_id = `form-${crypto.randomUUID()}`;
+    }
+
+    const sourceRef =
+      body.source_file_reference != null && String(body.source_file_reference).trim()
+        ? String(body.source_file_reference).trim().slice(0, 500)
+        : 'from-formulation';
+
+    const payload = {
+      project_id: projectId,
+      experiment_id,
+      experiment_version: 1,
+      technology_domain: ex.technology_domain || 'unknown',
+      formula: ex.formula,
+      materials: materialsForLab,
+      percentages: ex.percentages,
+      results: null,
+      experiment_outcome: 'partial',
+      is_production_formula: false,
+      source_file_reference: sourceRef,
+      updated_at: new Date().toISOString()
+    };
+
+    const { data: existing, error: exErr } = await supabase
+      .from('lab_experiments')
+      .select('id, experiment_version')
+      .eq('project_id', projectId)
+      .eq('experiment_id', experiment_id)
+      .maybeSingle();
+    if (exErr) throw exErr;
+
+    let row;
+    if (existing) {
+      payload.experiment_version = (existing.experiment_version || 0) + 1;
+      const { data, error } = await supabase
+        .from('lab_experiments')
+        .update(payload)
+        .eq('project_id', projectId)
+        .eq('experiment_id', experiment_id)
+        .select('id, experiment_id, experiment_version, technology_domain, formula')
+        .single();
+      if (error) throw error;
+      row = data;
+    } else {
+      const { data, error } = await supabase
+        .from('lab_experiments')
+        .insert(payload)
+        .select('id, experiment_id, experiment_version, technology_domain, formula')
+        .single();
+      if (error) throw error;
+      row = data;
+    }
+
+    const tableMissing = (msg) => /relation|does not exist|experiment_materials/i.test(String(msg || ''));
+
+    let materials_written = 0;
+    if (matRowsMeta.length > 0) {
+      const insertRows = matRowsMeta.map((m) => ({
+        project_id: projectId,
+        lab_experiment_id: row.id,
+        material_name: m.material_name,
+        weight_percent: m.weight_percent,
+        sort_order: m.sort_order
+      }));
+      const { error: delErr } = await supabase.from('experiment_materials').delete().eq('lab_experiment_id', row.id);
+      if (delErr) {
+        if (tableMissing(delErr.message)) {
+          return res.status(503).json({
+            error:
+              'הטבלה experiment_materials חסרה. הרץ את maneger-back/sql/create_experiment_materials.sql ב-Supabase.',
+            experiment: row,
+            materials_written: 0
+          });
+        }
+        throw delErr;
+      }
+      const { error: insErr } = await supabase.from('experiment_materials').insert(insertRows);
+      if (insErr) {
+        if (tableMissing(insErr.message)) {
+          return res.status(503).json({
+            error:
+              'הטבלה experiment_materials חסרה. הרץ את maneger-back/sql/create_experiment_materials.sql ב-Supabase.',
+            experiment: row,
+            materials_written: 0
+          });
+        }
+        throw insErr;
+      }
+      materials_written = insertRows.length;
+    } else {
+      const { error: delErr } = await supabase.from('experiment_materials').delete().eq('lab_experiment_id', row.id);
+      if (delErr && !tableMissing(delErr.message)) throw delErr;
+    }
+
+    res.status(201).json({ experiment: row, materials_written });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/projects/:projectId/experiments/sync-to-matriya', async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
@@ -2023,6 +2225,196 @@ function normalizeFormulaForCompare(formula) {
   if (formula == null) return '';
   return String(formula).replace(/\s+/g, ' ').trim().toLowerCase();
 }
+
+function experimentMaterialNameSet(exp) {
+  const s = new Set();
+  if (!exp || exp.materials == null) return s;
+  const mats = exp.materials;
+  if (Array.isArray(mats)) {
+    for (const m of mats) {
+      if (typeof m === 'string' && m.trim()) s.add(m.trim().toLowerCase());
+      else if (m && typeof m === 'object' && m.name) s.add(String(m.name).trim().toLowerCase());
+    }
+  } else if (typeof mats === 'object') {
+    for (const k of Object.keys(mats)) s.add(String(k).trim().toLowerCase());
+  }
+  return s;
+}
+
+/** Same-project formulation similarity; data fields only (no recommendations). */
+function buildLabExperimentRagQuery(row) {
+  if (!row || typeof row !== 'object') return '';
+  const parts = [];
+  if (row.technology_domain && String(row.technology_domain).trim()) parts.push(String(row.technology_domain).trim());
+  if (row.formula != null && String(row.formula).trim()) parts.push(String(row.formula).trim().slice(0, 800));
+  const mats = row.materials;
+  if (Array.isArray(mats)) {
+    for (const m of mats.slice(0, 24)) {
+      if (typeof m === 'string' && m.trim()) parts.push(m.trim());
+      else if (m && typeof m === 'object' && m.name) parts.push(String(m.name).trim());
+    }
+  } else if (mats && typeof mats === 'object') {
+    parts.push(...Object.keys(mats).slice(0, 24));
+  }
+  const q = parts.filter(Boolean).join(' ').trim();
+  return q.slice(0, 2000) || '';
+}
+
+function mapMatriyaSearchHitToSimilarDoc(hit) {
+  const text = (hit && (hit.document || hit.text || '')) || '';
+  const meta = (hit && hit.metadata) || {};
+  return {
+    filename: meta.filename || meta.source || 'Unknown',
+    text_preview: text.slice(0, 600),
+    distance: typeof hit.distance === 'number' ? hit.distance : null,
+    metadata: {
+      chunk_index: meta.chunk_index,
+      filename: meta.filename
+    }
+  };
+}
+
+function similarFormulationsFromProjectLab(experiments, current, limit = 20) {
+  const id = current.experiment_id;
+  const curDomain = (current.technology_domain || '').trim().toLowerCase();
+  const curNorm = normalizeFormulaForCompare(current.formula);
+  const curMats = experimentMaterialNameSet(current);
+
+  function score(e) {
+    let s = 0;
+    const ed = (e.technology_domain || '').trim().toLowerCase();
+    if (curDomain && ed === curDomain) s += 2;
+    if (curNorm && normalizeFormulaForCompare(e.formula) === curNorm) s += 5;
+    const em = experimentMaterialNameSet(e);
+    for (const m of curMats) {
+      if (em.has(m)) s += 1;
+    }
+    return s;
+  }
+
+  return experiments
+    .filter((e) => e.experiment_id !== id)
+    .map((e) => ({ e, score: score(e) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => ({
+      experiment_id: x.e.experiment_id,
+      technology_domain: x.e.technology_domain,
+      formula: x.e.formula,
+      experiment_outcome: x.e.experiment_outcome,
+      is_production_formula: !!x.e.is_production_formula
+    }));
+}
+
+/**
+ * GET /api/matriya/insights/:experimentId?project_id=
+ * Data-only bridge to Matriya: similar documents (RAG) + similar formulations.
+ * Requires project membership. No recommendations / next experiment (stage 2 later).
+ */
+app.get('/api/matriya/insights/:experimentId', async (req, res) => {
+  try {
+    const projectId = req.query.project_id || req.query.projectId;
+    if (!projectId) {
+      return res.status(400).json({ error: 'project_id query parameter is required' });
+    }
+    const ctx = await requireProjectMember(req, res, projectId);
+    if (!ctx) return;
+
+    const experimentId = req.params.experimentId != null ? String(req.params.experimentId) : '';
+    if (!experimentId) {
+      return res.status(400).json({ error: 'experimentId is required' });
+    }
+
+    const { data: labRow, error: labErr } = await supabase
+      .from('lab_experiments')
+      .select('*')
+      .eq('project_id', projectId)
+      .eq('experiment_id', experimentId)
+      .maybeSingle();
+    if (labErr) throw labErr;
+    if (!labRow) {
+      return res.status(404).json({ error: 'Experiment not found in this project' });
+    }
+
+    if (!MATRIYA_BACK_URL) {
+      return res.status(503).json({ error: 'MATRIYA_BACK_URL not set' });
+    }
+
+    const headers = {};
+    if (req.headers.authorization) headers.Authorization = req.headers.authorization;
+
+    let payload = {
+      experiment_id: experimentId,
+      matriya_experiment_found: false,
+      rag_query_used: null,
+      similar_documents: [],
+      similar_formulations: []
+    };
+
+    try {
+      const r = await axios.get(
+        `${MATRIYA_BACK_URL}/insights/experiment/${encodeURIComponent(experimentId)}`,
+        { headers, timeout: 45000 }
+      );
+      if (r.data && typeof r.data === 'object') {
+        payload = {
+          experiment_id: r.data.experiment_id || experimentId,
+          matriya_experiment_found: !!r.data.matriya_experiment_found,
+          rag_query_used: r.data.rag_query_used ?? null,
+          similar_documents: Array.isArray(r.data.similar_documents) ? r.data.similar_documents : [],
+          similar_formulations: Array.isArray(r.data.similar_formulations) ? r.data.similar_formulations : []
+        };
+      }
+    } catch (e) {
+      const st = e.response?.status;
+      const body = e.response?.data;
+      if (st === 401 || st === 403) {
+        return res.status(st).json(body || { error: 'Matriya auth failed for insights' });
+      }
+      console.error('Matriya insights error:', st || e.code, body || e.message);
+      return res.status(502).json({
+        error: 'Failed to fetch insights from Matriya',
+        detail: body?.error || e.message
+      });
+    }
+
+    if (!payload.matriya_experiment_found || payload.similar_formulations.length === 0) {
+      const all = await getExperimentsForAnalysis(projectId);
+      const localSim = similarFormulationsFromProjectLab(all, labRow, 20);
+      if (localSim.length) {
+        const seen = new Set(payload.similar_formulations.map((x) => x.experiment_id));
+        for (const row of localSim) {
+          if (seen.has(row.experiment_id)) continue;
+          seen.add(row.experiment_id);
+          payload.similar_formulations.push(row);
+        }
+      }
+    }
+
+    if (payload.similar_documents.length === 0 && labRow) {
+      const fallbackQuery = buildLabExperimentRagQuery(labRow);
+      if (fallbackQuery) {
+        try {
+          const sr = await axios.get(`${MATRIYA_BACK_URL}/search`, {
+            params: { query: fallbackQuery, generate_answer: 'false', n_results: 10 },
+            headers,
+            timeout: 45000
+          });
+          const hits = sr.data?.results || [];
+          payload.similar_documents = hits.map(mapMatriyaSearchHitToSimilarDoc);
+          if (!payload.rag_query_used) payload.rag_query_used = fallbackQuery;
+        } catch (_) {
+          /* optional: Matriya search unavailable */
+        }
+      }
+    }
+
+    return res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get('/api/projects/:projectId/analysis/contradictions', async (req, res) => {
   try {
@@ -4045,10 +4437,14 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
 
     const text = extractOpenAiResponsesOutputText(r.data);
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
-    const sources = dedupeAndCapSources(rawSnippets, q, text);
+    const hasUsableSnippets =
+      Array.isArray(rawSnippets) &&
+      rawSnippets.some((s) => String(s.text || s.content || '').trim().length > 0);
+    const synthesis = hasUsableSnippets ? String(text || '').trim() : RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+    const sources = hasUsableSnippets ? dedupeAndCapSources(rawSnippets, q, synthesis) : [];
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
-      outputs: { synthesis: text, research: text, analysis: text },
+      outputs: { synthesis, research: synthesis, analysis: synthesis },
       justifications: [],
       sources
     });
@@ -4116,7 +4512,11 @@ app.post('/api/rag/search', async (req, res) => {
     const filterMetadata = filename && typeof filename === 'string' && filename.trim() ? { filename: filename.trim() } : null;
     if (generate_answer) {
       const out = await rag.generateAnswer(query || '', n_results, filterMetadata, true);
-      return res.json({ results: out.results, answer: out.answer, context: out.context });
+      const answer =
+        out.answer && String(out.answer).trim()
+          ? out.answer
+          : RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+      return res.json({ results: out.results, answer, context: out.context });
     }
     const results = await rag.search(query || '', n_results, filterMetadata);
     res.json({ results });
@@ -4142,19 +4542,8 @@ app.post('/api/rag/research/run', async (req, res) => {
     const rag = await getLocalRag();
     if (!rag) return res.status(503).json({ error: 'RAG not available' });
     const out = await rag.generateAnswer(query, 20, filterMetadata, true);
-    let synthesis = out.answer || '';
-    if (!synthesis && (filterMetadata?.filename || filterMetadata?.filenames)) {
-      const indexedSet = new Set(await rag.getAllFilenames());
-      const requested = filenamesArray || [];
-      const notIndexed = requested.filter(f => !indexedSet.has(f));
-      if (notIndexed.length) {
-        synthesis = 'הקובץ שנבחר לא באינדוקס (פורמט לא נתמך או טרם עובד). בחר "כל הקבצים" או קובץ אחר מהרשימה.';
-      } else {
-        synthesis = 'לא נמצא תוכן במערכת עבור הקובץ שנבחר. נסה לבחור "כל הקבצים" או להריץ שוב את סקריפט האינדוקס.';
-      }
-    } else if (!synthesis) {
-      synthesis = 'לא נמצא תוכן במערכת. ייתכן שקבצים טרם עובדו (אינדוקס). וודא שהקבצים הועלו והריץ את סקריפט האינדוקס.';
-    }
+    let synthesis =
+      out.answer && String(out.answer).trim() ? out.answer.trim() : RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
     res.json({
       run_id: crypto.randomUUID(),
       outputs: { synthesis, research: synthesis, analysis: synthesis },
