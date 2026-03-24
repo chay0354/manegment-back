@@ -183,6 +183,7 @@ app.set('trust proxy', 1); // Vercel sends X-Forwarded-For; required for express
 /** Comma-separated list in CORS_ORIGINS (Vercel env). Default includes production frontend + local dev. */
 const DEFAULT_CORS_ORIGINS = [
   'https://manegment-front.vercel.app',
+  'https://matriya-front.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000',
   'http://localhost:3001',
