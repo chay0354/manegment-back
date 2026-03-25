@@ -13,7 +13,11 @@ import axios from 'axios';
 import FormData from 'form-data';
 import { z } from 'zod';
 import * as XLSX from 'xlsx';
-import { syncProjectGptRagToOpenAI, buildProjectFileCatalogAppendix } from './lib/gptRagSync.js';
+import {
+  syncProjectGptRagToOpenAI,
+  buildProjectFileCatalogAppendix,
+  removeProjectFileFromGptRagAndOpenAi
+} from './lib/gptRagSync.js';
 import { RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE } from './lib/ragService.js';
 /** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
 
@@ -3399,11 +3403,51 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
 
 app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
   try {
-    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    const projectId = req.params.projectId;
+    const fileId = req.params.fileId;
+    const ctx = await requireProjectMember(req, res, projectId);
     if (!ctx) return;
-    const { error } = await supabase.from('project_files').delete().eq('id', req.params.fileId).eq('project_id', req.params.projectId);
+
+    const { data: row, error: fetchErr } = await supabase
+      .from('project_files')
+      .select('id, original_name, storage_path, openai_file_id')
+      .eq('id', fileId)
+      .eq('project_id', projectId)
+      .single();
+    if (fetchErr || !row) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const originalName = String(row.original_name || '').trim();
+    if (hasLocalRag() && originalName) {
+      try {
+        const rag = await getLocalRag();
+        if (rag?.vectorStore) {
+          await rag.vectorStore.deleteDocuments(null, { filename: originalName });
+        }
+      } catch (e) {
+        console.warn('[delete project_file] management RAG cleanup:', e.message);
+      }
+    }
+
+    if (OPENAI_API_KEY) {
+      await removeProjectFileFromGptRagAndOpenAi(supabase, projectId, row, {
+        openaiApiKey: OPENAI_API_KEY,
+        openaiBase: OPENAI_API_BASE
+      });
+    }
+
+    if (row.storage_path && String(row.storage_path).trim()) {
+      try {
+        const { bucket, storagePath } = resolveBucketAndPath(String(row.storage_path));
+        await supabase.storage.from(bucket).remove([storagePath]).catch(() => {});
+      } catch (_) {}
+    }
+
+    const { error } = await supabase.from('project_files').delete().eq('id', fileId).eq('project_id', projectId);
     if (error) throw error;
-    auditLog(req.params.projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', req.params.fileId, null, req.requestId);
+    auditLog(projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', fileId, null, req.requestId);
+    scheduleOpenAiVectorSyncForProject(projectId, 'after-file-delete');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
