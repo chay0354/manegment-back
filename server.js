@@ -2889,6 +2889,19 @@ app.delete('/api/projects/:projectId/lab/saved-experiments/:id', async (req, res
 });
 
 // ---------- Lab AI insights (OpenAI GPT) ----------
+/** Behavioral rules for Lab AI (encoded in server logic, not UI copy). */
+const LAB_AI_RESEARCH_CONSTITUTION = `
+כללי אמינות חובה למעבדה:
+- אין לנחש: אם אין בסיס בנתוני ההקשר — אמור במפורש שאין מידע תומך; אל תמציא ערכים או פורמולציות.
+- כמה ערכים או סתירות לאותו רכיב/חומר — הצג אי־ודאות או פער, עם הפניה לשורות/תאים; לא לבחור ערך אחד בלי נימוק מהנתונים.
+- ערך יחיד שמופיע בבירור — תשובה חד־משמעית ומגובה (ציטוט או שם עמודה/שורה).
+- טבלאות Markdown/Excel: שורת כותרת = שמות עמודות; שורות מתחת = רשומות. לשאלות על יחסים/אחוזים/הרכב של אותם נתונים — ענה בעקביות (אותה מסקנה לניסוחים שקולים).
+- נרמול מספרים (למשל 0.6715 מול 67.15%) — אחד לייצוג אחיד או הסבר קצר אם יש שתי פרשנויות אפשריות.
+- שאלה על פורמולציה/הרכב — התמקד בנתוני פורמולציה מההקשר בלבד; אל תערבב מסמכים/ציוד שלא רלוונטיים.
+- אסור להחזיר תשובה ריקה; תמיד טקסט בעברית — לפחות משפט אחד ברור (כולל "אין מידע תומך" אם אין בסיס).
+- עקביות: לא לשנות מסקנה אקראית בין ניסוחים זהים של אותה משימה על אותו קלט.
+`.trim();
+
 const LAB_AI_INSIGHT_TASKS = {
   insights: { title: 'תובנות מהדאטה', instruction: 'סכם תובנות עיקריות מהנתונים: שיעור הצלחה, כישלונות, מגמות לפי תחום. תן סיכום תמציתי בעברית.' },
   contradictions: { title: 'זיהוי סתירות', instruction: 'זהה סתירות: אותה פורמולה עם תוצאות שונות. רשום כל סתירה עם מזהי הניסויים והתוצאות. אם אין – כתוב שאין סתירות. עברית.' },
@@ -2927,7 +2940,9 @@ app.post('/api/projects/:projectId/lab/ai-insight', async (req, res) => {
     const task = LAB_AI_INSIGHT_TASKS[insightType];
     if (!task || !context) return res.status(400).json({ error: 'Body must include experimentContext (string) and insightType (one of: ' + Object.keys(LAB_AI_INSIGHT_TASKS).join(', ') + ').' });
     const systemPrompt = `אתה מומחה לניתוח נתוני ניסויים ומעבדה. אתה מקבל טקסט או נתוני ניסוי ומבצע את המשימה המבוקשת. כל התשובות בעברית בלבד.
-אם מופיעות טבלאות בפורמט Markdown (שורות שבהן התאים מופרדים בתו |), התייחס לשורת הכותרת כשמות עמודות, לכל שורה מתחת כרשומה, ואל תמזג עמודות או שורות בלי צורך מבורר.`;
+אם מופיעות טבלאות בפורמט Markdown (שורות שבהן התאים מופרדים בתו |), התייחס לשורת הכותרת כשמות עמודות, לכל שורה מתחת כרשומה, ואל תמזג עמודות או שורות בלי צורך מבורר.
+
+${LAB_AI_RESEARCH_CONSTITUTION}`;
     const userPrompt = `משימה: ${task.title}\n\nהוראות: ${task.instruction}\n\nנתוני הניסוי/הקשר:\n${context.slice(0, 24000)}`;
     const response = await axios.post(
       'https://api.openai.com/v1/chat/completions',
@@ -2938,7 +2953,7 @@ app.post('/api/projects/:projectId/lab/ai-insight', async (req, res) => {
           { role: 'user', content: userPrompt }
         ],
         max_tokens: 2000,
-        temperature: 0.3
+        temperature: 0
       },
       {
         headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
