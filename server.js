@@ -2611,12 +2611,80 @@ app.post('/api/projects/:projectId/guard/check', async (req, res) => {
   }
 });
 
-// ---------- Lab: parse experiment file to text (Excel → readable text for AI) ----------
+// ---------- Lab: Excel → Markdown tables (clear structure for UI + LLM) ----------
+const LAB_EXCEL_MD_MAX_COLS = Math.min(60, Math.max(4, parseInt(process.env.LAB_EXCEL_MD_MAX_COLS || '40', 10) || 40));
+const LAB_EXCEL_MD_MAX_ROWS = Math.min(2000, Math.max(20, parseInt(process.env.LAB_EXCEL_MD_MAX_ROWS || '500', 10) || 500));
+
+function escapeMarkdownTableCell(value) {
+  let s = String(value ?? '').trim();
+  s = s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  s = s.replace(/\n/g, ' ');
+  s = s.replace(/\|/g, '\\|');
+  return s.length ? s : ' ';
+}
+
+/** Trim trailing empty cells per row; drop completely empty rows. */
+function normalizeExcelRowsAsArrays(rows) {
+  if (!Array.isArray(rows)) return [];
+  const out = [];
+  for (const r of rows) {
+    if (!Array.isArray(r)) continue;
+    const cells = r.map((c) => String(c ?? '').trim());
+    const trimmed = [...cells];
+    while (trimmed.length && !String(trimmed[trimmed.length - 1] ?? '').trim()) trimmed.pop();
+    if (trimmed.some((c) => c.length > 0)) out.push(trimmed);
+  }
+  return out;
+}
+
+/**
+ * Normalized rectangular matrix for Excel → UI grid and Markdown (same row/col caps).
+ * @returns {{ paddedRows: string[][], colCount: number } | null}
+ */
+function labExcelPaddedMatrix(sourceRows) {
+  const normalized = normalizeExcelRowsAsArrays(sourceRows).slice(0, LAB_EXCEL_MD_MAX_ROWS);
+  if (normalized.length === 0) return null;
+  let maxCols = 0;
+  for (const r of normalized) maxCols = Math.max(maxCols, r.length);
+  const colCount = Math.min(maxCols, LAB_EXCEL_MD_MAX_COLS);
+  if (colCount === 0) return null;
+  const pad = (r) => {
+    const a = r.slice(0, colCount).map((c) => String(c ?? ''));
+    while (a.length < colCount) a.push('');
+    return a;
+  };
+  return { paddedRows: normalized.map(pad), colCount };
+}
+
+/**
+ * Build a GitHub-flavored Markdown table from 2D cell arrays (header = first row).
+ */
+function excelRowsToMarkdownTable(rows) {
+  const m = labExcelPaddedMatrix(rows);
+  if (!m) return '';
+  const { paddedRows, colCount } = m;
+  if (paddedRows.length === 1) {
+    const headers = Array.from({ length: colCount }, (_, i) => `עמודה ${i + 1}`);
+    const data = paddedRows[0];
+    const headerLine = '| ' + headers.map(escapeMarkdownTableCell).join(' | ') + ' |';
+    const sepLine = '| ' + headers.map(() => '---').join(' | ') + ' |';
+    const dataLine = '| ' + data.map(escapeMarkdownTableCell).join(' | ') + ' |';
+    return `${headerLine}\n${sepLine}\n${dataLine}`;
+  }
+  const headerCells = paddedRows[0];
+  const bodyRows = paddedRows.slice(1);
+  const headerLine = '| ' + headerCells.map(escapeMarkdownTableCell).join(' | ') + ' |';
+  const sepLine = '| ' + headerCells.map(() => '---').join(' | ') + ' |';
+  const bodyLines = bodyRows.map((row) => '| ' + row.map(escapeMarkdownTableCell).join(' | ') + ' |');
+  return [headerLine, sepLine, ...bodyLines].join('\n');
+}
+
+// ---------- Lab: parse experiment file to text (Excel → Markdown tables for AI) ----------
 /**
  * Same parsing as POST /lab/parse-experiment-file; used for email→Lab import to avoid re-upload + extra round trips.
  * @param {Buffer} buffer
  * @param {string} originalName
- * @returns {Promise<{ text: string }>}
+ * @returns {Promise<{ text: string, excelSheets?: { name: string, rows: string[][] }[] }>}
  */
 async function parseExperimentBufferToText(buffer, originalName) {
   if (!buffer || !Buffer.isBuffer(buffer)) {
@@ -2628,22 +2696,30 @@ async function parseExperimentBufferToText(buffer, originalName) {
   if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
     try {
       const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
-      const parts = [];
+      const intro =
+        'הנתונים הופקו מקובץ Excel. כל גיליון מוצג כטבלת Markdown (עמודות בשורת כותרת, שורות נתונים מתחת). ' +
+        'יש לנתח לפי מבנה העמודות והשורות.\n\n';
+      const parts = [intro];
+      /** @type {{ name: string, rows: string[][] }[]} */
+      const excelSheets = [];
       for (const sheetName of wb.SheetNames || []) {
         const ws = wb.Sheets[sheetName];
         if (!ws) continue;
         const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false, header: 1 });
-        if (rows.length) {
-          parts.push(`[גיליון: ${sheetName}]`);
-          for (const row of rows) {
-            const line = Array.isArray(row) ? row.map(c => String(c ?? '').trim()).join('\t') : Object.entries(row).map(([k, v]) => `${k}: ${v}`).join(', ');
-            if (line.replace(/\s/g, '')) parts.push(line);
-          }
+        const safeName = String(sheetName || 'Sheet').replace(/#/g, ' ');
+        const matrix = labExcelPaddedMatrix(rows);
+        if (matrix && matrix.paddedRows.length > 0) {
+          excelSheets.push({ name: safeName, rows: matrix.paddedRows });
+        }
+        const md = excelRowsToMarkdownTable(rows);
+        if (md) {
+          parts.push(`### גיליון: ${safeName}`);
+          parts.push(md);
           parts.push('');
         }
       }
       const text = parts.join('\n').trim() || 'הקובץ ריק או ללא נתונים ניתנים לקריאה.';
-      return { text };
+      return { text, excelSheets };
     } catch (err) {
       if (err.message && /corrupt|invalid|xlsx|workbook/i.test(err.message)) {
         const e = new Error('קובץ Excel פגום או בפורמט לא נתמך.');
@@ -2746,8 +2822,8 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
     const ctx = await requireProjectMember(req, res, req.params.projectId);
     if (!ctx) return;
     if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded. Send multipart form with field "file".' });
-    const { text } = await parseExperimentBufferToText(req.file.buffer, req.file.originalname);
-    return res.json({ text });
+    const { text, excelSheets } = await parseExperimentBufferToText(req.file.buffer, req.file.originalname);
+    return res.json({ text, excelSheets: excelSheets ?? null });
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ error: e.message });
     if (e.statusCode === 503) return res.status(503).json({ error: e.message });
@@ -2850,8 +2926,9 @@ app.post('/api/projects/:projectId/lab/ai-insight', async (req, res) => {
     const context = typeof experimentContext === 'string' ? experimentContext.trim() : '';
     const task = LAB_AI_INSIGHT_TASKS[insightType];
     if (!task || !context) return res.status(400).json({ error: 'Body must include experimentContext (string) and insightType (one of: ' + Object.keys(LAB_AI_INSIGHT_TASKS).join(', ') + ').' });
-    const systemPrompt = `אתה מומחה לניתוח נתוני ניסויים ומעבדה. אתה מקבל טקסט או נתוני ניסוי ומבצע את המשימה המבוקשת. כל התשובות בעברית בלבד.`;
-    const userPrompt = `משימה: ${task.title}\n\nהוראות: ${task.instruction}\n\nנתוני הניסוי/הקשר:\n${context.slice(0, 12000)}`;
+    const systemPrompt = `אתה מומחה לניתוח נתוני ניסויים ומעבדה. אתה מקבל טקסט או נתוני ניסוי ומבצע את המשימה המבוקשת. כל התשובות בעברית בלבד.
+אם מופיעות טבלאות בפורמט Markdown (שורות שבהן התאים מופרדים בתו |), התייחס לשורת הכותרת כשמות עמודות, לכל שורה מתחת כרשומה, ואל תמזג עמודות או שורות בלי צורך מבורר.`;
+    const userPrompt = `משימה: ${task.title}\n\nהוראות: ${task.instruction}\n\nנתוני הניסוי/הקשר:\n${context.slice(0, 24000)}`;
     const response = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
@@ -3259,16 +3336,21 @@ app.post('/api/projects/:projectId/emails/:storedEmailId/import-attachment', lim
     const labParsePromise =
       destination === 'lab'
         ? parseExperimentBufferToText(buf, filename)
-            .then((r) => r.text)
+            .then((r) => ({ text: r.text, excelSheets: r.excelSheets }))
             .catch(() => null)
         : null;
     const row = await createProjectFileFromBuffer(projectId, ctx, buf, filename, folderLabel, req, { contentType: ct });
-    const lab_parsed_text = labParsePromise != null ? await labParsePromise : null;
+    const labParsed = labParsePromise != null ? await labParsePromise : null;
+    const lab_parsed_text = labParsed?.text ?? null;
+    const lab_parsed_excel_sheets =
+      labParsed && Array.isArray(labParsed.excelSheets) && labParsed.excelSheets.length > 0
+        ? labParsed.excelSheets
+        : null;
     res.status(201).json({
       file: row,
       ingestible: isMatriyaIngestible(filename),
       destination,
-      ...(destination === 'lab' ? { lab_parsed_text } : {})
+      ...(destination === 'lab' ? { lab_parsed_text, lab_parsed_excel_sheets } : {})
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
