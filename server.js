@@ -159,16 +159,43 @@ const GPT_RAG_AUTO_SYNC_DEBOUNCE_MS = Math.max(
 );
 const gptRagAutoSyncTimers = new Map();
 
-function scheduleOpenAiVectorSyncForProject(projectId, hint = '') {
+/** @type {Map<string, { mode: 'full' } | { mode: 'partial'; ids: Set<string> }>} */
+const gptRagPendingByProject = new Map();
+
+/**
+ * @param {string} projectId
+ * @param {string} [hint]
+ * @param {string | null} [projectFileId] - when set, prefer syncing only this project_files row (merged per debounce). Omit for full-project sync.
+ */
+function scheduleOpenAiVectorSyncForProject(projectId, hint = '', projectFileId = null) {
   if (!OPENAI_API_KEY || !projectId) return;
   const id = String(projectId);
+
+  if (projectFileId == null || projectFileId === '') {
+    gptRagPendingByProject.set(id, { mode: 'full' });
+  } else {
+    const fid = String(projectFileId);
+    const cur = gptRagPendingByProject.get(id);
+    if (cur?.mode === 'full') {
+      /* keep full */
+    } else if (cur?.mode === 'partial') {
+      cur.ids.add(fid);
+    } else {
+      gptRagPendingByProject.set(id, { mode: 'partial', ids: new Set([fid]) });
+    }
+  }
+
   const prev = gptRagAutoSyncTimers.get(id);
   if (prev) clearTimeout(prev);
   const t = setTimeout(() => {
     gptRagAutoSyncTimers.delete(id);
+    const spec = gptRagPendingByProject.get(id);
+    gptRagPendingByProject.delete(id);
+    const onlyProjectFileIds = spec?.mode === 'partial' ? [...spec.ids] : undefined;
     syncProjectGptRagToOpenAI(supabase, id, {
       openaiApiKey: OPENAI_API_KEY,
       openaiBase: OPENAI_API_BASE,
+      onlyProjectFileIds,
       onLog: (msg) => console.log('[gpt-rag auto-sync]', hint || id, msg)
     })
       .then((r) => {
@@ -3137,7 +3164,7 @@ function ingestFileInBackground(projectId, projectFileId, buffer, originalName) 
         await supabase.from('project_files').update({ ingest_error: result.error || 'Indexing failed' }).eq('id', projectFileId);
       } else {
         await supabase.from('project_files').update({ ingest_error: null }).eq('id', projectFileId).then(() => {}, () => {});
-        if (projectId) scheduleOpenAiVectorSyncForProject(projectId, 'after-local-rag-index');
+        if (projectId) scheduleOpenAiVectorSyncForProject(projectId, 'after-local-rag-index', projectFileId);
       }
     } catch (e) {
       const errMsg = e.message || 'Indexing failed';
@@ -3194,7 +3221,7 @@ async function createProjectFileFromBuffer(projectId, ctx, buffer, originalName,
   if (hasLocalRag() && buf && buf.length) {
     setImmediate(() => ingestFileInBackground(projectId, rowOut.id, Buffer.from(buf), name));
   }
-  if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, syncReasonTag);
+  if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, syncReasonTag, rowOut.id);
   return rowOut;
 }
 
@@ -3394,7 +3421,7 @@ app.post('/api/projects/:projectId/files', limiterUpload, upload.single('file'),
     if (hasLocalRag() && buffer) {
       setImmediate(() => ingestFileInBackground(projectId, rowOut.id, buffer, originalName));
     }
-    if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'multipart');
+    if (rowOut.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'multipart', rowOut.id);
   } catch (e) {
     const status = e.response?.status || 500;
     const data = e.response?.data || { error: e.message };
@@ -3449,7 +3476,6 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
     const { error } = await supabase.from('project_files').delete().eq('id', fileId).eq('project_id', projectId);
     if (error) throw error;
     auditLog(projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', fileId, null, req.requestId);
-    scheduleOpenAiVectorSyncForProject(projectId, 'after-file-delete');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4186,7 +4212,7 @@ app.post('/api/projects/:projectId/files/from-bucket', async (req, res) => {
     if (hasLocalRag()) {
       setImmediate(() => ingestFileInBackground(projectId, row.id, buffer, originalName));
     }
-    if (row.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'from-bucket');
+    if (row.storage_path) scheduleOpenAiVectorSyncForProject(projectId, 'from-bucket', row.id);
   } catch (e) {
     res.status(e.response?.status || 500).json({ error: e.response?.data?.error || e.message });
   }
