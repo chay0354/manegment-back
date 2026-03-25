@@ -3458,25 +3458,39 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
       }
     }
 
-    if (OPENAI_API_KEY) {
-      await removeProjectFileFromGptRagAndOpenAi(supabase, projectId, row, {
-        openaiApiKey: OPENAI_API_KEY,
-        openaiBase: OPENAI_API_BASE,
-        onLog: (m) => console.log('[gpt-rag file delete]', m)
-      });
-    }
-
-    if (row.storage_path && String(row.storage_path).trim()) {
-      try {
-        const { bucket, storagePath } = resolveBucketAndPath(String(row.storage_path));
-        await supabase.storage.from(bucket).remove([storagePath]).catch(() => {});
-      } catch (_) {}
-    }
-
     const { error } = await supabase.from('project_files').delete().eq('id', fileId).eq('project_id', projectId);
     if (error) throw error;
     auditLog(projectId, ctx.user.id, ctx.user.username, 'delete', 'project_file', fileId, null, req.requestId);
     res.json({ success: true });
+
+    // OpenAI detach + storage remove can take a long time; reply first so the UI does not stick on «מוחק…» (same idea as Matriya DELETE /files).
+    const rowSnapshot = {
+      id: row.id,
+      original_name: row.original_name,
+      storage_path: row.storage_path,
+      openai_file_id: row.openai_file_id
+    };
+    setImmediate(() => {
+      (async () => {
+        if (OPENAI_API_KEY) {
+          try {
+            await removeProjectFileFromGptRagAndOpenAi(supabase, projectId, rowSnapshot, {
+              openaiApiKey: OPENAI_API_KEY,
+              openaiBase: OPENAI_API_BASE,
+              onLog: (m) => console.log('[gpt-rag file delete]', m)
+            });
+          } catch (e) {
+            console.warn('[delete project_file] OpenAI cleanup:', e.message);
+          }
+        }
+        if (rowSnapshot.storage_path && String(rowSnapshot.storage_path).trim()) {
+          try {
+            const { bucket, storagePath } = resolveBucketAndPath(String(rowSnapshot.storage_path));
+            await supabase.storage.from(bucket).remove([storagePath]).catch(() => {});
+          } catch (_) {}
+        }
+      })();
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
