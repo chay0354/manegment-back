@@ -16,7 +16,8 @@ import * as XLSX from 'xlsx';
 import {
   syncProjectGptRagToOpenAI,
   buildProjectFileCatalogAppendix,
-  removeProjectFileFromGptRagAndOpenAi
+  removeProjectFileFromGptRagAndOpenAi,
+  filterProjectGptSnippetsToIndex
 } from './lib/gptRagSync.js';
 import { RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE } from './lib/ragService.js';
 /** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
@@ -3433,7 +3434,8 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
     if (OPENAI_API_KEY) {
       await removeProjectFileFromGptRagAndOpenAi(supabase, projectId, row, {
         openaiApiKey: OPENAI_API_KEY,
-        openaiBase: OPENAI_API_BASE
+        openaiBase: OPENAI_API_BASE,
+        onLog: (m) => console.log('[gpt-rag file delete]', m)
       });
     }
 
@@ -4482,11 +4484,12 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
 
     const text = extractOpenAiResponsesOutputText(r.data);
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
+    const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
     const hasUsableSnippets =
-      Array.isArray(rawSnippets) &&
-      rawSnippets.some((s) => String(s.text || s.content || '').trim().length > 0);
+      Array.isArray(snippets) &&
+      snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
     const synthesis = hasUsableSnippets ? String(text || '').trim() : RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
-    const sources = hasUsableSnippets ? dedupeAndCapSources(rawSnippets, q, synthesis) : [];
+    const sources = hasUsableSnippets ? dedupeAndCapSources(snippets, q, synthesis) : [];
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
       outputs: { synthesis, research: synthesis, analysis: synthesis },
