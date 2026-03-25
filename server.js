@@ -4049,6 +4049,7 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
     const registered = [];
     const errors = [];
     let registerIngestNewRows = 0;
+    const registerIngestNewIds = [];
     for (const item of paths) {
       const path = (item && item.path) ? String(item.path).trim() : '';
       const name = (item && item.name) ? String(item.name).trim() : path.split('/').pop() || 'file';
@@ -4079,6 +4080,7 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
         }
         registered.push({ id: fileRow.id, name });
         registerIngestNewRows += 1;
+        registerIngestNewIds.push(fileRow.id);
         if (isMatriyaIngestible(name)) {
           setImmediate(() => ingestFileInBackground(projectId, fileRow.id, buffer, name));
         }
@@ -4086,7 +4088,11 @@ app.post('/api/projects/:projectId/files/register-and-ingest', async (req, res) 
         errors.push({ path, name, error: e.message || String(e) });
       }
     }
-    if (registerIngestNewRows > 0) scheduleOpenAiVectorSyncForProject(projectId, 'register-ingest');
+    if (registerIngestNewRows > 0) {
+      for (const fid of registerIngestNewIds) {
+        scheduleOpenAiVectorSyncForProject(projectId, 'register-ingest', fid);
+      }
+    }
     res.status(201).json({ registered: registered.length, registered_ids: registered.map(r => r.id), errors: errors.length ? errors : undefined });
   } catch (e) {
     res.status(500).json({ error: e.message || 'Failed to register and ingest' });
@@ -4252,22 +4258,6 @@ function openAiVectorStoreHeaders() {
   };
 }
 
-function extractOpenAiResponsesOutputText(data) {
-  if (!data || typeof data !== 'object') return '';
-  if (typeof data.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
-  const out = data.output;
-  if (!Array.isArray(out)) return '';
-  const parts = [];
-  for (const item of out) {
-    if (item.type === 'message' && Array.isArray(item.content)) {
-      for (const c of item.content) {
-        if (c && typeof c.text === 'string' && (c.type === 'output_text' || c.type === 'text')) parts.push(c.text);
-      }
-    }
-  }
-  return parts.join('\n\n').trim();
-}
-
 /** From Responses API when `include: ['file_search_call.results']` — evidence for UI quotes. */
 function collectFileSearchSnippetsFromResponse(data) {
   const chunks = [];
@@ -4320,6 +4310,47 @@ function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
     if (t.length >= 3 && snippetLower.includes(t)) s += 1;
   }
   return s;
+}
+
+/**
+ * User-visible answer for project GPT RAG: built only from snippets that match live project_files.
+ * The first Responses API message may reflect stale files still attached in OpenAI; do not use it as synthesis.
+ */
+async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets) {
+  const key = OPENAI_API_KEY;
+  if (!key) return '';
+  const list = Array.isArray(snippets) ? snippets : [];
+  const parts = list.slice(0, 12).map((s, i) => {
+    const fn = String(s.filename || 'Unknown');
+    const body = String(s.text || s.content || '').trim().slice(0, 7000);
+    return `קטע ${i + 1} (מקור: ${fn}):\n${body}`;
+  });
+  const context = parts.join('\n\n---\n\n');
+  if (!context.trim()) return '';
+  const systemContent =
+    'ענו בעברית בלבד (אלא אם המשתמש ביקש במפורש שפה אחרת). ' +
+    'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
+    'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
+    'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
+    'אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: אין במערכת מידע תומך לשאלה זו.\n\nציטוטים:\n' +
+    context;
+  const r = await axios.post(
+    `${OPENAI_API_BASE}/chat/completions`,
+    {
+      model: OPENAI_RAG_MODEL,
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: String(userQuery || '').trim().slice(0, 12000) }
+      ],
+      max_tokens: 1024,
+      temperature: 0.2
+    },
+    {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      timeout: 90000
+    }
+  );
+  return String(r.data?.choices?.[0]?.message?.content || '').trim();
 }
 
 /** Dedupe, rank by overlap with user query and model answer, cap for UI (same idea as matriya-back). */
@@ -4439,9 +4470,15 @@ app.post('/api/projects/:projectId/gpt-rag/sync', limiterRag, async (req, res) =
     if (!ctx) return;
     if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
 
+    const rawIds = req.body?.only_project_file_ids;
+    const onlyProjectFileIds = Array.isArray(rawIds)
+      ? rawIds.map((x) => String(x || '').trim()).filter(Boolean)
+      : undefined;
+
     const result = await syncProjectGptRagToOpenAI(supabase, projectId, {
       openaiApiKey: OPENAI_API_KEY,
-      openaiBase: OPENAI_API_BASE
+      openaiBase: OPENAI_API_BASE,
+      ...(onlyProjectFileIds && onlyProjectFileIds.length > 0 ? { onlyProjectFileIds } : {})
     });
     if (!result.ok) {
       return res.status(result.status).json({
@@ -4457,7 +4494,9 @@ app.post('/api/projects/:projectId/gpt-rag/sync', limiterRag, async (req, res) =
       uploaded: result.uploaded,
       incremental: Boolean(result.incremental),
       skipped: result.skipped,
-      batch_status: result.batch_status
+      batch_status: result.batch_status,
+      indexing_pending: Boolean(result.indexing_pending),
+      batch_id: result.batch_id || undefined
     });
   } catch (e) {
     console.error('[gpt-rag/sync]', e.response?.data || e.message);
@@ -4508,13 +4547,22 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       timeout: 120000
     });
 
-    const text = extractOpenAiResponsesOutputText(r.data);
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
     const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
     const hasUsableSnippets =
       Array.isArray(snippets) &&
       snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
-    const synthesis = hasUsableSnippets ? String(text || '').trim() : RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+
+    let synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+    if (hasUsableSnippets) {
+      try {
+        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, snippets);
+      } catch (e) {
+        console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
+        synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+      }
+      if (!synthesis || synthesis.length < 2) synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+    }
     const sources = hasUsableSnippets ? dedupeAndCapSources(snippets, q, synthesis) : [];
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
