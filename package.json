@@ -7,6 +7,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "test": "npm run test:unit",
+    "test:unit": "node scripts/verify-david-checklist.mjs",
+    "verify:david-checklist": "node scripts/verify-david-checklist.mjs",
     "index:vector": "node scripts/index-all-files-to-management-vector.js",
     "index:vector:list": "node scripts/index-all-files-to-management-vector.js --list",
     "register:bucket": "node scripts/register-bucket-files-to-project.js",

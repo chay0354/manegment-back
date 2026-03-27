@@ -20,6 +20,18 @@ import {
   filterProjectGptSnippetsToIndex
 } from './lib/gptRagSync.js';
 import { RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE } from './lib/ragService.js';
+import {
+  UUID_IN_TEXT_RE,
+  parseEmailOnly,
+  extractProjectIdFromInboundPayload
+} from './lib/inboundProjectRouting.js';
+import { parseExperimentBufferToText } from './lib/labExperimentParse.js';
+import {
+  assessLabEmailAttachmentImport,
+  isLabEmailStrictValidationEnabled
+} from './lib/labEmailImportValidation.js';
+import { deleteManagementVectorByFilename } from './lib/managementRagDelete.js';
+import { sendLabImportIncompleteEmail } from './lib/sendLabImportIncompleteEmail.js';
 /** Do not static-import pdf-to-img: it loads pdfjs-dist which needs canvas/DOM and crashes Vercel cold start. */
 
 const PORT = parseInt(process.env.PORT, 10) || 8001;
@@ -40,6 +52,8 @@ const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 מותר: לקחת כמה ציטוטים מתוצאות file_search; לקצר אותם; לארגן אותם למשפטים ברורים.
 אסור: להוסיף מידע שלא מופיע בציטוטים; להשלים פערים; להסיק מעבר למה שכתוב בציטוטים.
 כלומר: התשובה = טרנספורמציה של הציטוטים בלבד — בלי עובדות שלא ניתן לקשר ישירות לטקסט שמוצג כציטוט.
+
+דירוג / «מה הכי טוב» / המלצה: אסור לקבוע פורמולה מנצחת, «מומלץ» או עדיפות אלא אם ציטוט מהמסמכים אומר זאת במפורש; אחרת תיאור ניטרלי מן הציטוטים בלבד או משפט ה-FAIL-SAFE למטה.
 
 English (same contract): You may take several excerpts from file_search, shorten them, and arrange into clear sentences. You must NOT add information absent from those excerpts, fill gaps, or infer beyond what the quoted text actually states. Every factual claim must trace to quoted retrieval text.
 
@@ -72,60 +86,6 @@ const RESEND_REPLY_DOMAIN = (process.env.RESEND_REPLY_DOMAIN || '').trim() || (R
 const PUBLIC_API_BASE = (process.env.PUBLIC_API_BASE_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '') || '').replace(/\/$/, '');
 /** folder_display_name for files imported from email into “Lab” */
 const LAB_EMAIL_IMPORT_FOLDER = 'Lab · email import';
-
-const UUID_IN_TEXT_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/i;
-
-/** Parse "Name <email@x.com>" or "email@x.com" → email@x.com */
-function parseEmailOnly(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  const m = raw.match(/<([^>]+)>/);
-  return (m ? m[1] : raw).trim();
-}
-
-/** Find project UUID embedded in any recipient (e.g. ec9e94e5-...@inbound.domain.com). */
-function extractProjectIdFromAddresses(addresses) {
-  if (!Array.isArray(addresses)) return null;
-  for (const a of addresses) {
-    const email = parseEmailOnly(String(a)).toLowerCase();
-    const hit = email.match(UUID_IN_TEXT_RE);
-    if (hit) return hit[1];
-    const local = email.split('@')[0] || '';
-    const hit2 = local.match(UUID_IN_TEXT_RE);
-    if (hit2) return hit2[1];
-  }
-  return null;
-}
-
-/** Resolve project UUID from inbound email: webhook ?project_id=..., To/Cc/Bcc, headers, or subject. */
-function extractProjectIdFromInboundPayload(full, query) {
-  const rawQ = query && query.project_id != null ? String(query.project_id).trim() : '';
-  if (rawQ) {
-    const m = rawQ.match(UUID_IN_TEXT_RE);
-    if (m) return m[1].toLowerCase();
-  }
-  const toList = [];
-  const push = (arr) => {
-    if (!Array.isArray(arr)) return;
-    for (const x of arr) toList.push(typeof x === 'string' ? x : (x && String(x)));
-  };
-  push(full.to);
-  push(full.cc);
-  push(full.bcc);
-  let pid = extractProjectIdFromAddresses(toList);
-  if (pid) return pid.toLowerCase();
-  const headers = full.headers;
-  if (headers && typeof headers === 'object') {
-    try {
-      const blob = JSON.stringify(headers);
-      const m = blob.match(UUID_IN_TEXT_RE);
-      if (m) return m[1].toLowerCase();
-    } catch (_) {}
-  }
-  const subj = String(full.subject || '');
-  const m2 = subj.match(UUID_IN_TEXT_RE);
-  if (m2) return m2[1].toLowerCase();
-  return null;
-}
 
 function replyToAddressForProject(projectId) {
   if (!projectId || !RESEND_REPLY_DOMAIN || RESEND_REPLY_DOMAIN.includes('resend.dev')) return null;
@@ -2611,212 +2571,7 @@ app.post('/api/projects/:projectId/guard/check', async (req, res) => {
   }
 });
 
-// ---------- Lab: Excel → Markdown tables (clear structure for UI + LLM) ----------
-const LAB_EXCEL_MD_MAX_COLS = Math.min(60, Math.max(4, parseInt(process.env.LAB_EXCEL_MD_MAX_COLS || '40', 10) || 40));
-const LAB_EXCEL_MD_MAX_ROWS = Math.min(2000, Math.max(20, parseInt(process.env.LAB_EXCEL_MD_MAX_ROWS || '500', 10) || 500));
-
-function escapeMarkdownTableCell(value) {
-  let s = String(value ?? '').trim();
-  s = s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  s = s.replace(/\n/g, ' ');
-  s = s.replace(/\|/g, '\\|');
-  return s.length ? s : ' ';
-}
-
-/** Trim trailing empty cells per row; drop completely empty rows. */
-function normalizeExcelRowsAsArrays(rows) {
-  if (!Array.isArray(rows)) return [];
-  const out = [];
-  for (const r of rows) {
-    if (!Array.isArray(r)) continue;
-    const cells = r.map((c) => String(c ?? '').trim());
-    const trimmed = [...cells];
-    while (trimmed.length && !String(trimmed[trimmed.length - 1] ?? '').trim()) trimmed.pop();
-    if (trimmed.some((c) => c.length > 0)) out.push(trimmed);
-  }
-  return out;
-}
-
-/**
- * Normalized rectangular matrix for Excel → UI grid and Markdown (same row/col caps).
- * @returns {{ paddedRows: string[][], colCount: number } | null}
- */
-function labExcelPaddedMatrix(sourceRows) {
-  const normalized = normalizeExcelRowsAsArrays(sourceRows).slice(0, LAB_EXCEL_MD_MAX_ROWS);
-  if (normalized.length === 0) return null;
-  let maxCols = 0;
-  for (const r of normalized) maxCols = Math.max(maxCols, r.length);
-  const colCount = Math.min(maxCols, LAB_EXCEL_MD_MAX_COLS);
-  if (colCount === 0) return null;
-  const pad = (r) => {
-    const a = r.slice(0, colCount).map((c) => String(c ?? ''));
-    while (a.length < colCount) a.push('');
-    return a;
-  };
-  return { paddedRows: normalized.map(pad), colCount };
-}
-
-/**
- * Build a GitHub-flavored Markdown table from 2D cell arrays (header = first row).
- */
-function excelRowsToMarkdownTable(rows) {
-  const m = labExcelPaddedMatrix(rows);
-  if (!m) return '';
-  const { paddedRows, colCount } = m;
-  if (paddedRows.length === 1) {
-    const headers = Array.from({ length: colCount }, (_, i) => `עמודה ${i + 1}`);
-    const data = paddedRows[0];
-    const headerLine = '| ' + headers.map(escapeMarkdownTableCell).join(' | ') + ' |';
-    const sepLine = '| ' + headers.map(() => '---').join(' | ') + ' |';
-    const dataLine = '| ' + data.map(escapeMarkdownTableCell).join(' | ') + ' |';
-    return `${headerLine}\n${sepLine}\n${dataLine}`;
-  }
-  const headerCells = paddedRows[0];
-  const bodyRows = paddedRows.slice(1);
-  const headerLine = '| ' + headerCells.map(escapeMarkdownTableCell).join(' | ') + ' |';
-  const sepLine = '| ' + headerCells.map(() => '---').join(' | ') + ' |';
-  const bodyLines = bodyRows.map((row) => '| ' + row.map(escapeMarkdownTableCell).join(' | ') + ' |');
-  return [headerLine, sepLine, ...bodyLines].join('\n');
-}
-
-// ---------- Lab: parse experiment file to text (Excel → Markdown tables for AI) ----------
-/**
- * Same parsing as POST /lab/parse-experiment-file; used for email→Lab import to avoid re-upload + extra round trips.
- * @param {Buffer} buffer
- * @param {string} originalName
- * @returns {Promise<{ text: string, excelSheets?: { name: string, rows: string[][] }[] }>}
- */
-async function parseExperimentBufferToText(buffer, originalName) {
-  if (!buffer || !Buffer.isBuffer(buffer)) {
-    const e = new Error('No file uploaded. Send multipart form with field "file".');
-    e.statusCode = 400;
-    throw e;
-  }
-  const name = (originalName || '').toLowerCase();
-  if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-    try {
-      const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
-      const intro =
-        'הנתונים הופקו מקובץ Excel. כל גיליון מוצג כטבלת Markdown (עמודות בשורת כותרת, שורות נתונים מתחת). ' +
-        'יש לנתח לפי מבנה העמודות והשורות.\n\n';
-      const parts = [intro];
-      /** @type {{ name: string, rows: string[][] }[]} */
-      const excelSheets = [];
-      for (const sheetName of wb.SheetNames || []) {
-        const ws = wb.Sheets[sheetName];
-        if (!ws) continue;
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false, header: 1 });
-        const safeName = String(sheetName || 'Sheet').replace(/#/g, ' ');
-        const matrix = labExcelPaddedMatrix(rows);
-        if (matrix && matrix.paddedRows.length > 0) {
-          excelSheets.push({ name: safeName, rows: matrix.paddedRows });
-        }
-        const md = excelRowsToMarkdownTable(rows);
-        if (md) {
-          parts.push(`### גיליון: ${safeName}`);
-          parts.push(md);
-          parts.push('');
-        }
-      }
-      const text = parts.join('\n').trim() || 'הקובץ ריק או ללא נתונים ניתנים לקריאה.';
-      return { text, excelSheets };
-    } catch (err) {
-      if (err.message && /corrupt|invalid|xlsx|workbook/i.test(err.message)) {
-        const e = new Error('קובץ Excel פגום או בפורמט לא נתמך.');
-        e.statusCode = 400;
-        throw e;
-      }
-      throw err;
-    }
-  }
-  if (name.endsWith('.csv') || name.endsWith('.txt') || name.endsWith('.json')) {
-    const raw = buffer.toString('utf-8');
-    const text = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim() || 'הקובץ ריק.';
-    return { text };
-  }
-  if (name.endsWith('.pdf')) {
-    try {
-      /* Fast path: text-layer PDFs via pdf-parse (ms). Slow path: per-page vision only if text layer is empty/thin. */
-      let fromParse = '';
-      try {
-        const pdfParse = (await import('pdf-parse')).default;
-        const data = await pdfParse(buffer);
-        fromParse = String(data?.text || '')
-          .replace(/\r\n/g, '\n')
-          .trim();
-      } catch (_) {
-        /* Encrypted or unusual PDFs: try vision below when not on Vercel */
-      }
-      const significantChars = fromParse.replace(/\s/g, '').length;
-      const PDF_TEXT_ENOUGH = 99;
-      if (significantChars >= PDF_TEXT_ENOUGH) {
-        return { text: fromParse };
-      }
-
-      if (process.env.VERCEL) {
-        return {
-          text:
-            fromParse ||
-            'לא נמצא טקסט בשכבת הטקסט של ה־PDF (ייתכן שזה סריקה בתמונה). נסה מקומית או המר ל־PDF עם טקסט.'
-        };
-      }
-
-      if (!OPENAI_API_KEY) {
-        if (significantChars > 0) {
-          return { text: fromParse };
-        }
-        const e = new Error('OPENAI_API_KEY לא מוגדר. הגדר את המפתח ב־.env לחילוץ טקסט מ־PDF באמצעות AI (שימוש בתמונות עמוד).');
-        e.statusCode = 503;
-        throw e;
-      }
-      const { pdf } = await import('pdf-to-img');
-      const dataUrl = `data:application/pdf;base64,${buffer.toString('base64')}`;
-      const document = await pdf(dataUrl, { scale: 2 });
-      const parts = [];
-      let pageNum = 0;
-      const maxPages = 50;
-      for await (const image of document) {
-        pageNum++;
-        if (pageNum > maxPages) break;
-        const b64 = image.toString('base64');
-        const visionResp = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          {
-            model: 'gpt-4o-mini',
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: 'Extract all text from this document page. Preserve order, structure, and original language (e.g. Hebrew or English). Output only the extracted text, no commentary.'
-                  },
-                  { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } }
-                ]
-              }
-            ],
-            max_tokens: 4096,
-            temperature: 0
-          },
-          { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 60000 }
-        );
-        const pageText = (visionResp.data?.choices?.[0]?.message?.content || '').trim();
-        if (pageText) parts.push(pageText);
-      }
-      const text = parts.join('\n\n').trim() || 'הקובץ ריק או ללא טקסט.';
-      return { text };
-    } catch (pdfErr) {
-      const msg = pdfErr.response?.data?.error?.message || pdfErr.message || '';
-      const e = new Error('לא ניתן לחלץ טקסט מקובץ ה־PDF באמצעות AI. ייתכן שהקובץ פגום או ש־OPENAI_API_KEY חסר/לא תקין. ' + msg);
-      e.statusCode = 400;
-      throw e;
-    }
-  }
-  const e = new Error('סוג קובץ לא נתמך. השתמש ב־PDF, XLSX, XLS, CSV, TXT או JSON.');
-  e.statusCode = 400;
-  throw e;
-}
-
+// ---------- Lab: parse experiment file (implementation in lib/labExperimentParse.js) ----------
 app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, upload.single('file'), async (req, res) => {
   try {
     const ctx = await requireProjectMember(req, res, req.params.projectId);
@@ -2827,7 +2582,7 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ error: e.message });
     if (e.statusCode === 503) return res.status(503).json({ error: e.message });
-    if (e.message && /corrupt|invalid|xlsx|workbook/i.test(e.message)) return res.status(400).json({ error: 'קובץ Excel פגום או בפורמט לא נתמך.' });
+    if (e.message && /corrupt|invalid|xlsx|workbook|unsupported zip/i.test(e.message)) return res.status(400).json({ error: 'קובץ Excel פגום או בפורמט לא נתמך.' });
     res.status(500).json({ error: e.message || 'שגיאה בפענוח הקובץ.' });
   }
 });
@@ -3350,15 +3105,69 @@ app.post('/api/projects/:projectId/emails/:storedEmailId/import-attachment', lim
     const filename = attMeta.filename || 'attachment';
     const folderLabel = destination === 'lab' ? LAB_EMAIL_IMPORT_FOLDER : null;
     const ct = attMeta.content_type || attMeta.contentType || 'application/octet-stream';
-    /** Run Lab text extraction in parallel with storage upload (same buffer) — saves wall time vs sequential. */
-    const labParsePromise =
-      destination === 'lab'
-        ? parseExperimentBufferToText(buf, filename)
-            .then((r) => ({ text: r.text, excelSheets: r.excelSheets }))
-            .catch(() => null)
-        : null;
+
+    let labParsed = null;
+    if (destination === 'lab') {
+      try {
+        labParsed = await parseExperimentBufferToText(buf, filename);
+      } catch (_) {
+        labParsed = null;
+      }
+      if (isLabEmailStrictValidationEnabled()) {
+        const assessment = assessLabEmailAttachmentImport({
+          text: labParsed?.text ?? '',
+          excelSheets: labParsed?.excelSheets ?? null,
+          filename
+        });
+        if (!assessment.ok) {
+          let completion_email_sent = false;
+          let email_error = null;
+          if (RESEND_API_KEY && mailRow.from_email) {
+            const send = await sendLabImportIncompleteEmail({
+              apiKey: RESEND_API_KEY,
+              fromEmail: RESEND_FROM_EMAIL,
+              toEmail: mailRow.from_email,
+              replyTo: replyToAddressForProject(projectId),
+              missing: assessment.missing,
+              filename
+            });
+            completion_email_sent = send.sent;
+            email_error = send.resendError || null;
+          }
+
+          const meta = {
+            status: 'pending_incomplete',
+            missing: assessment.missing,
+            attachment_id,
+            filename,
+            updated_at: new Date().toISOString(),
+            completion_email_sent
+          };
+          const { error: metaErr } = await supabase
+            .from('project_emails')
+            .update({ lab_import_meta: meta })
+            .eq('id', mailRow.id)
+            .eq('project_id', projectId);
+          if (metaErr) {
+            console.warn(
+              '[import-attachment] lab_import_meta update failed (run sql/alter_project_emails_lab_import_meta.sql?):',
+              metaErr.message
+            );
+          }
+
+          return res.status(422).json({
+            status: 'pending',
+            lab_import_status: 'pending_incomplete',
+            missing: assessment.missing,
+            completion_email_sent,
+            email_error,
+            hint: 'הקובץ לא נשמר ולא נכנס ל-RAG. לאחר השלמת הנתונים שלחו שוב.'
+          });
+        }
+      }
+    }
+
     const row = await createProjectFileFromBuffer(projectId, ctx, buf, filename, folderLabel, req, { contentType: ct });
-    const labParsed = labParsePromise != null ? await labParsePromise : null;
     const lab_parsed_text = labParsed?.text ?? null;
     const lab_parsed_excel_sheets =
       labParsed && Array.isArray(labParsed.excelSheets) && labParsed.excelSheets.length > 0
@@ -3550,9 +3359,7 @@ app.delete('/api/projects/:projectId/files/:fileId', async (req, res) => {
     if (hasLocalRag() && originalName) {
       try {
         const rag = await getLocalRag();
-        if (rag?.vectorStore) {
-          await rag.vectorStore.deleteDocuments(null, { filename: originalName });
-        }
+        await deleteManagementVectorByFilename(rag, originalName);
       } catch (e) {
         console.warn('[delete project_file] management RAG cleanup:', e.message);
       }
