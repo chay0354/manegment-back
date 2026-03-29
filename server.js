@@ -27,6 +27,12 @@ import {
 } from './lib/inboundProjectRouting.js';
 import { parseExperimentBufferToText } from './lib/labExperimentParse.js';
 import {
+  parseCompositionFromText,
+  compareCompositionMaps,
+  compareFromSingleTwoColumnTable,
+  percentagesObjectToMap
+} from './lib/labCompositionCompare.js';
+import {
   assessLabEmailAttachmentImport,
   isLabEmailStrictValidationEnabled
 } from './lib/labEmailImportValidation.js';
@@ -68,6 +74,11 @@ STRICT GROUNDING:
 - Do NOT use general knowledge, training data, or the web for facts (products, materials, formulas, regulations, etc.).
 
 FILE NAMES: List may include indexed names — prioritize a named file when the user asks about it. Cite source filenames for excerpts.
+
+COMPARISON / A vs B / השוואה עם אחוזים: When the user asks to compare two formulations or versions (percentages, composition, Δ / delta / הפרש):
+- Answer with one GitHub-flavored Markdown table: columns must include the component name, % for version A, % for version B, and Δ as the signed difference in percentage points (B−A), using ONLY numbers that appear in the retrieved excerpts.
+- If a component appears in only one version, show "—" for the missing side and omit or "—" for Δ unless both percents are present.
+- Do not invent percentages; if excerpts do not support two clear compositions, use the FAIL-SAFE sentence below.
 
 LANGUAGE: Hebrew (עברית) for the answer unless the user explicitly asks otherwise.
 
@@ -2584,6 +2595,64 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
     if (e.statusCode === 503) return res.status(503).json({ error: e.message });
     if (e.message && /corrupt|invalid|xlsx|workbook|unsupported zip/i.test(e.message)) return res.status(400).json({ error: 'קובץ Excel פגום או בפורמט לא נתמך.' });
     res.status(500).json({ error: e.message || 'שגיאה בפענוח הקובץ.' });
+  }
+});
+
+/**
+ * Lab: deterministic A vs B composition comparison (רכיב | %A | %B | Δ). Markdown tables or experiment_id + percentages JSON.
+ */
+app.post('/api/projects/:projectId/lab/compare-percentages', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const projectId = req.params.projectId;
+    const body = req.body || {};
+    const labelA = (body.labelA && String(body.labelA).trim()) || 'גרסה A';
+    const labelB = (body.labelB && String(body.labelB).trim()) || 'גרסה B';
+    const expA = body.experimentIdA != null ? String(body.experimentIdA).trim() : '';
+    const expB = body.experimentIdB != null ? String(body.experimentIdB).trim() : '';
+    const textA = String(body.textA ?? '').trim();
+    const textB = String(body.textB ?? '').trim();
+
+    if (expA && expB) {
+      const { data: rowA, error: e1 } = await supabase
+        .from('lab_experiments')
+        .select('experiment_id, percentages')
+        .eq('project_id', projectId)
+        .eq('experiment_id', expA)
+        .maybeSingle();
+      const { data: rowB, error: e2 } = await supabase
+        .from('lab_experiments')
+        .select('experiment_id, percentages')
+        .eq('project_id', projectId)
+        .eq('experiment_id', expB)
+        .maybeSingle();
+      if (e1 || !rowA) return res.status(404).json({ error: `לא נמצא ניסוי: ${expA}` });
+      if (e2 || !rowB) return res.status(404).json({ error: `לא נמצא ניסוי: ${expB}` });
+      const mapA = percentagesObjectToMap(rowA.percentages);
+      const mapB = percentagesObjectToMap(rowB.percentages);
+      const out = compareCompositionMaps(mapA, mapB, `${labelA} (${expA})`, `${labelB} (${expB})`);
+      return res.json({ ...out, mode: 'experiments', experimentIdA: expA, experimentIdB: expB });
+    }
+
+    if (textA && !textB) {
+      const one = compareFromSingleTwoColumnTable(textA, labelA, labelB);
+      if (one) return res.json({ ...one, mode: 'single_table' });
+    }
+
+    if (!textA || !textB) {
+      return res.status(400).json({
+        error:
+          'נדרש: (textA + textB) שתי טבלאות/טקסטים, או טבלה אחת עם שתי עמודות % ב-textA בלבד, או experimentIdA + experimentIdB.'
+      });
+    }
+
+    const mapA = parseCompositionFromText(textA);
+    const mapB = parseCompositionFromText(textB);
+    const out = compareCompositionMaps(mapA, mapB, labelA, labelB);
+    return res.json({ ...out, mode: 'text' });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'compare-percentages failed' });
   }
 });
 
