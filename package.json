@@ -10,6 +10,7 @@
     "test": "npm run test:unit",
     "test:unit": "node scripts/verify-david-checklist.mjs",
     "verify:david-checklist": "node scripts/verify-david-checklist.mjs",
+    "verify:phase-b": "node scripts/verify-phase-b-core.mjs",
     "index:vector": "node scripts/index-all-files-to-management-vector.js",
     "index:vector:list": "node scripts/index-all-files-to-management-vector.js --list",
     "register:bucket": "node scripts/register-bucket-files-to-project.js",

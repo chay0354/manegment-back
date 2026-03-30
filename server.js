@@ -33,6 +33,20 @@ import {
   percentagesObjectToMap
 } from './lib/labCompositionCompare.js';
 import {
+  parseMeasurementQuestion,
+  selectExperimentsForRagPreface,
+  buildExperimentDataPrefaceHebrew,
+  validateMeasurementsArray,
+  compareViscosityExperiments,
+  coerceMeasurements,
+  measurementsFromExcelRow
+} from './lib/labMeasurements.js';
+import {
+  classifyLabDocument,
+  extractExperimentFieldsFromText,
+  measurementsFromExtractedFields
+} from './lib/labDocumentClassify.js';
+import {
   assessLabEmailAttachmentImport,
   isLabEmailStrictValidationEnabled
 } from './lib/labEmailImportValidation.js';
@@ -83,6 +97,8 @@ COMPARISON / A vs B / השוואה עם אחוזים: When the user asks to comp
 LANGUAGE: Hebrew (עברית) for the answer unless the user explicitly asks otherwise.
 
 The vector store is exclusively this user's current project — never treat content as coming from elsewhere.
+
+STRUCTURED EXPERIMENT DATA (Phase B): If the user message begins with a block marked [נתוני ניסויים מובנים — ...], those lines come from this project's lab_experiments.measurements in the database. For questions about viscosity (cps), pH, RPM, temperature, or numbers listed in that block, treat that block as the primary source of truth and answer from it first; use file_search excerpts only to supplement when the question is not fully answered by the block.
 
 FAIL-SAFE (deterministic): If file_search returns no usable excerpt text, respond with this single Hebrew sentence only — no bullet lists, no recommendations, no next steps, no "however" or alternatives:
 אין במערכת מידע תומך לשאלה זו.`;
@@ -1952,6 +1968,8 @@ app.post('/api/projects/:projectId/import/experiment-excel', limiterUpload, uplo
         source_file_reference,
         updated_at: new Date().toISOString()
       };
+      const meas = measurementsFromExcelRow(row, col);
+      if (meas) payload.measurements = meas;
 
       const { data: existing } = await supabase.from('lab_experiments').select('id, experiment_version').eq('project_id', projectId).eq('experiment_id', payload.experiment_id).single();
       if (existing) {
@@ -2278,6 +2296,22 @@ function mapMatriyaSearchHitToSimilarDoc(hit) {
   };
 }
 
+/** Lab experiments with optional measurements JSON (Phase B RAG preface). */
+async function getLabExperimentsForMeasurementRag(projectId) {
+  try {
+    const { data, error } = await supabase
+      .from('lab_experiments')
+      .select('experiment_id, id, measurements, results')
+      .eq('project_id', projectId)
+      .order('updated_at', { ascending: false })
+      .limit(400);
+    if (error) throw error;
+    return data || [];
+  } catch (_) {
+    return [];
+  }
+}
+
 function similarFormulationsFromProjectLab(experiments, current, limit = 20) {
   const id = current.experiment_id;
   const curDomain = (current.technology_domain || '').trim().toLowerCase();
@@ -2589,7 +2623,16 @@ app.post('/api/projects/:projectId/lab/parse-experiment-file', limiterUpload, up
     if (!ctx) return;
     if (!req.file || !req.file.buffer) return res.status(400).json({ error: 'No file uploaded. Send multipart form with field "file".' });
     const { text, excelSheets } = await parseExperimentBufferToText(req.file.buffer, req.file.originalname);
-    return res.json({ text, excelSheets: excelSheets ?? null });
+    const docClass = classifyLabDocument(req.file.originalname, text);
+    const extracted = extractExperimentFieldsFromText(text);
+    const suggested_measurements = measurementsFromExtractedFields(extracted);
+    return res.json({
+      text,
+      excelSheets: excelSheets ?? null,
+      document_classification: docClass,
+      extracted_fields: { viscosity: extracted.viscosity, ph: extracted.ph, rpm: extracted.rpm },
+      suggested_measurements
+    });
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ error: e.message });
     if (e.statusCode === 503) return res.status(503).json({ error: e.message });
@@ -4523,11 +4566,22 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       .limit(200);
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
 
+    const mq = parseMeasurementQuestion(q);
+    let experimentPreface = '';
+    if (mq.wantsMeasurement) {
+      const expRows = await getLabExperimentsForMeasurementRag(projectId);
+      const selected = selectExperimentsForRagPreface(expRows, mq);
+      experimentPreface = buildExperimentDataPrefaceHebrew(selected);
+    }
+
+    const inputWithExperiments =
+      (experimentPreface ? experimentPreface + '\n\n---\n\n' : '') + q + catalogAppendix;
+
     // Single vector store for this project only (sync uploads only project_files for this project_id).
     const payload = {
       model: OPENAI_RAG_MODEL,
       instructions: GPT_RAG_QUERY_INSTRUCTIONS,
-      input: q + catalogAppendix,
+      input: inputWithExperiments,
       tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: 24 }],
       include: ['file_search_call.results']
     };
@@ -4539,26 +4593,31 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
 
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
     const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
+    const mergedSnippets =
+      experimentPreface.trim().length > 0
+        ? [{ filename: 'ניסויים (מסד נתונים)', text: experimentPreface }, ...snippets]
+        : snippets;
     const hasUsableSnippets =
-      Array.isArray(snippets) &&
-      snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
+      Array.isArray(mergedSnippets) &&
+      mergedSnippets.some((s) => String(s.text || s.content || '').trim().length > 0);
 
     let synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
     if (hasUsableSnippets) {
       try {
-        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, snippets);
+        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, mergedSnippets);
       } catch (e) {
         console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
         synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
       }
       if (!synthesis || synthesis.length < 2) synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
     }
-    const sources = hasUsableSnippets ? dedupeAndCapSources(snippets, q, synthesis) : [];
+    const sources = hasUsableSnippets ? dedupeAndCapSources(mergedSnippets, q, synthesis) : [];
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
       outputs: { synthesis, research: synthesis, analysis: synthesis },
       justifications: [],
-      sources
+      sources,
+      experiment_rag_used: Boolean(experimentPreface.trim())
     });
   } catch (e) {
     console.error('[gpt-rag/query]', e.response?.data || e.message);
