@@ -51,6 +51,16 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
+const RAG_MEASUREMENT_SCHEMA_RULES = [
+  'Measurements schema: for measurement/comparison questions (viscosity, pH, cps, percentages), output strict JSON first with keys {"measurements":[],"comparisons":[],"evidence_links":[],"document_classification":[],"notes":[]}.',
+  'Each measurement must include metric, value, unit, conditions (rpm, temperature_c, sample, stage), and source_ref.',
+  'CPS rule: compare cps only when RPM exists and is equal for both compared values; otherwise set comparable=false and include reason.',
+  'RAG-to-experiment linkage: prioritize evidence with matching unit + conditions; fallback order: metric+unit, then metric only, and downgrade confidence accordingly.',
+  'Document classification: classify each cited source as formulation | experiment_result | qc_data with confidence high|medium|low.',
+  'For viscosity/pH conclusions prioritize experiment_result and qc_data over formulation-only excerpts; for composition percentages prioritize formulation excerpts.',
+  'Cross-field consistency: do not mix incompatible units/conditions in a single conclusion; if conflicting evidence appears, report it explicitly in notes.',
+  'Never invent missing values.'
+].join(' ');
 /** Grounded Q&A: only file_search; answer = transformation of quotes (shorten/organize OK; no new facts or inference). */
 const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
@@ -85,7 +95,9 @@ LANGUAGE: Hebrew (עברית) for the answer unless the user explicitly asks oth
 The vector store is exclusively this user's current project — never treat content as coming from elsewhere.
 
 FAIL-SAFE (deterministic): If file_search returns no usable excerpt text, respond with this single Hebrew sentence only — no bullet lists, no recommendations, no next steps, no "however" or alternatives:
-אין במערכת מידע תומך לשאלה זו.`;
+אין במערכת מידע תומך לשאלה זו.
+
+${RAG_MEASUREMENT_SCHEMA_RULES}`;
 
 function detectProjectGptUserLanguage(text) {
   return /[\u0590-\u05FF]/.test(String(text || '')) ? 'he' : 'en';
@@ -4334,6 +4346,7 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
+    `${RAG_MEASUREMENT_SCHEMA_RULES} ` +
     `אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: ${noSupport}\n\nציטוטים:\n` +
     context;
   const r = await axios.post(

@@ -112,6 +112,9 @@ async function main() {
         for (const target of MATRIYA_TARGETS) {
           const form = new FormData();
           form.append('file', buffer, { filename: file.original_name });
+          // Keep Matriya logical filename unique/stable across projects to avoid same-name overwrite loops.
+          // server.js maps this to displayFilename via req.body.relative_path.
+          form.append('relative_path', `${project.id}/${resolved.storagePath}`);
           try {
             const res = await axios.post(`${target}/ingest/file`, form, {
               timeout: 180000,
