@@ -52,7 +52,8 @@ const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
 const RAG_MEASUREMENT_SCHEMA_RULES = [
-  'Measurements schema applies ONLY for explicit measurement/comparison requests (viscosity, pH, cps, percentages, compare A vs B, delta).',
+  'Measurements schema applies ONLY for explicit measurement extraction requests (viscosity, pH, cps, percentages).',
+  'Do NOT use JSON schema for A/B comparison-table requests; comparison mode is table-only or INVALID.',
   'If the query is not explicitly measurement/comparison, do NOT output JSON; answer in normal prose.',
   'When schema mode is required, output strict JSON first with keys {"measurements":[],"comparisons":[],"evidence_links":[],"document_classification":[],"notes":[]}.',
   'Each measurement must include metric, value, unit, conditions (rpm, temperature_c, sample, stage), and source_ref.',
