@@ -52,7 +52,9 @@ const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
 const RAG_MEASUREMENT_SCHEMA_RULES = [
-  'Measurements schema: for measurement/comparison questions (viscosity, pH, cps, percentages), output strict JSON first with keys {"measurements":[],"comparisons":[],"evidence_links":[],"document_classification":[],"notes":[]}.',
+  'Measurements schema applies ONLY for explicit measurement/comparison requests (viscosity, pH, cps, percentages, compare A vs B, delta).',
+  'If the query is not explicitly measurement/comparison, do NOT output JSON; answer in normal prose.',
+  'When schema mode is required, output strict JSON first with keys {"measurements":[],"comparisons":[],"evidence_links":[],"document_classification":[],"notes":[]}.',
   'Each measurement must include metric, value, unit, conditions (rpm, temperature_c, sample, stage), and source_ref.',
   'CPS rule: compare cps only when RPM exists and is equal for both compared values; otherwise set comparable=false and include reason.',
   'RAG-to-experiment linkage: prioritize evidence with matching unit + conditions; fallback order: metric+unit, then metric only, and downgrade confidence accordingly.',
