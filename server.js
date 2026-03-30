@@ -65,6 +65,12 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_API_BASE = 'https://api.openai.com/v1';
 /** Model for GPT RAG (Responses API + file_search). */
 const OPENAI_RAG_MODEL = (process.env.OPENAI_RAG_MODEL || 'gpt-4o-mini').trim();
+/** Responses API file_search cap (OpenAI limit is 50). Raise via env when needed. */
+const GPT_RAG_FILE_SEARCH_MAX_RESULTS = (() => {
+  const n = parseInt(String(process.env.MANEGER_GPT_RAG_MAX_RESULTS || ''), 10);
+  if (Number.isFinite(n) && n > 0) return Math.min(50, n);
+  return 50;
+})();
 /** Grounded Q&A: only file_search; answer = transformation of quotes (shorten/organize OK; no new facts or inference). */
 const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
@@ -4459,6 +4465,30 @@ async function verifyOpenAiVectorStoreMatchesProject(vectorStoreId, projectId) {
   }
 }
 
+/**
+ * Full project catalog for GPT RAG filtering/citation scope.
+ * Do not cap to 200: older files must remain queryable and citable.
+ */
+async function listProjectFileCatalogRows(projectId) {
+  const pageSize = 1000;
+  const out = [];
+  for (let from = 0; from < 50000; from += pageSize) {
+    const to = from + pageSize - 1;
+    const { data, error } = await supabase
+      .from('project_files')
+      .select('original_name, storage_path')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .range(from, to);
+    if (error) throw error;
+    const rows = Array.isArray(data) ? data : [];
+    if (rows.length === 0) break;
+    out.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return out;
+}
+
 app.get('/api/projects/:projectId/gpt-rag/status', limiterRag, async (req, res) => {
   try {
     const projectId = req.params.projectId;
@@ -4558,13 +4588,8 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       return res.status(st).json({ error: verErr.message || 'Vector store verification failed' });
     }
 
-    const { data: catalogRows } = await supabase
-      .from('project_files')
-      .select('original_name, storage_path')
-      .eq('project_id', projectId)
-      .order('created_at', { ascending: false })
-      .limit(200);
-    const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
+    const catalogRows = await listProjectFileCatalogRows(projectId);
+    const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows);
 
     const mq = parseMeasurementQuestion(q);
     let experimentPreface = '';
@@ -4582,7 +4607,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       model: OPENAI_RAG_MODEL,
       instructions: GPT_RAG_QUERY_INSTRUCTIONS,
       input: inputWithExperiments,
-      tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: 24 }],
+      tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: GPT_RAG_FILE_SEARCH_MAX_RESULTS }],
       include: ['file_search_call.results']
     };
 
@@ -4592,7 +4617,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     });
 
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
-    const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
+    const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows);
     const mergedSnippets =
       experimentPreface.trim().length > 0
         ? [{ filename: 'ניסויים (מסד נתונים)', text: experimentPreface }, ...snippets]
