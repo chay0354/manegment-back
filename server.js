@@ -64,12 +64,12 @@ const RAG_MEASUREMENT_SCHEMA_RULES = [
   'Cross-field consistency: do not mix incompatible units/conditions in a single conclusion; if conflicting evidence appears, report it explicitly in notes.',
   'Never invent missing values.'
 ].join(' ');
-/** Grounded Q&A: only file_search; answer = transformation of quotes (shorten/organize OK; no new facts or inference). */
+/** Grounded Q&A: file_search + project-scoped structured snippets; answer = grounded transformation only. */
 const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 
 חוקי תשובה (חובה — עברית למשתמש אלא אם ביקשו אחרת):
-מותר: לקחת כמה ציטוטים מתוצאות file_search; לקצר אותם; לארגן אותם למשפטים ברורים.
-אסור: להוסיף מידע שלא מופיע בציטוטים; להשלים פערים; להסיק מעבר למה שכתוב בציטוטים.
+מותר: לקחת כמה ציטוטים מתוצאות file_search ומהקשר מובנה של הפרויקט (ספריית חומרים/קישור ניסוי→חומר); לקצר אותם; לארגן אותם למשפטים ברורים.
+אסור: להוסיף מידע שלא מופיע בציטוטים או בהקשר המובנה שסופק; להשלים פערים; להסיק מעבר למה שכתוב.
 כלומר: התשובה = טרנספורמציה של הציטוטים בלבד — בלי עובדות שלא ניתן לקשר ישירות לטקסט שמוצג כציטוט.
 
 דירוג / «מה הכי טוב» / המלצה: אסור לקבוע פורמולה מנצחת, «מומלץ» או עדיפות אלא אם ציטוט מהמסמכים אומר זאת במפורש; אחרת תיאור ניטרלי מן הציטוטים בלבד או משפט ה-FAIL-SAFE למטה.
@@ -83,7 +83,7 @@ English (same contract): You may take several excerpts from file_search, shorten
 GENERAL / OVERVIEW questions (e.g. what the document is about, main theme): You must answer by combining several retrieved excerpts into a clear high-level description or summary. This is required and allowed — it is source-based synthesis, not a single data-point reply. Still: no themes or details not clearly supported by those excerpts.
 
 STRICT GROUNDING:
-- Use ONLY content from file_search for this project's vector store for factual claims.
+- Use ONLY content from file_search for this project's vector store plus structured project snippets supplied in the same request.
 - Do NOT use general knowledge, training data, or the web for facts (products, materials, formulas, regulations, etc.).
 
 FILE NAMES: List may include indexed names — prioritize a named file when the user asks about it. Cite source filenames for excerpts.
@@ -2240,6 +2240,165 @@ app.post('/api/projects/:projectId/material-library', async (req, res) => {
   }
 });
 
+function normalizeMaterialName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function extractMaterialNamesFromExperimentRow(exp) {
+  const out = [];
+  const src = exp?.materials;
+  if (Array.isArray(src)) {
+    for (const item of src) {
+      if (typeof item === 'string' && item.trim()) out.push(item.trim());
+      else if (item && typeof item === 'object' && item.name != null && String(item.name).trim()) out.push(String(item.name).trim());
+    }
+    return out;
+  }
+  if (src && typeof src === 'object') {
+    for (const key of Object.keys(src)) {
+      if (String(key).trim()) out.push(String(key).trim());
+    }
+  }
+  return out;
+}
+
+function mergeMaterialExperimentLink(mapByMaterial, materialName, link) {
+  const key = normalizeMaterialName(materialName);
+  if (!key) return;
+  if (!mapByMaterial.has(key)) {
+    mapByMaterial.set(key, {
+      material_name: String(materialName || '').trim(),
+      role_or_function: null,
+      linked_experiments: [],
+      experiment_count: 0
+    });
+  }
+  const row = mapByMaterial.get(key);
+  if (!row.material_name || row.material_name.length < String(materialName || '').trim().length) {
+    row.material_name = String(materialName || '').trim();
+  }
+  const dedupeKey = `${String(link.experiment_id || '').trim()}\0${String(link.percentage ?? '')}\0${String(link.unit || '')}`;
+  if (!row._linkKeys) row._linkKeys = new Set();
+  if (row._linkKeys.has(dedupeKey)) return;
+  row._linkKeys.add(dedupeKey);
+  row.linked_experiments.push(link);
+  row.experiment_count = row.linked_experiments.length;
+}
+
+async function buildProjectMaterialsOverview(projectId) {
+  const { data: libraryRows, error: libErr } = await supabase
+    .from('material_library')
+    .select('name, role_or_function')
+    .eq('project_id', projectId)
+    .order('name');
+  if (libErr) throw libErr;
+
+  const { data: experiments, error: expErr } = await supabase
+    .from('lab_experiments')
+    .select('id, experiment_id, technology_domain, experiment_outcome, materials, percentages')
+    .eq('project_id', projectId)
+    .order('updated_at', { ascending: false });
+  if (expErr) throw expErr;
+
+  const mapByMaterial = new Map();
+  for (const row of libraryRows || []) {
+    const key = normalizeMaterialName(row.name);
+    if (!key) continue;
+    mapByMaterial.set(key, {
+      material_name: String(row.name || '').trim(),
+      role_or_function: row.role_or_function != null ? String(row.role_or_function).trim() || null : null,
+      linked_experiments: [],
+      experiment_count: 0
+    });
+  }
+
+  const experimentsById = new Map((experiments || []).map((e) => [String(e.id), e]));
+  let experimentMaterialsRows = null;
+  if (experimentsById.size > 0) {
+    try {
+      const { data: emRows, error: emErr } = await supabase
+        .from('experiment_materials')
+        .select('lab_experiment_id, material_name, weight_percent, sort_order')
+        .in('lab_experiment_id', [...experimentsById.keys()]);
+      if (emErr) throw emErr;
+      experimentMaterialsRows = emRows || [];
+    } catch (_) {
+      experimentMaterialsRows = null;
+    }
+  } else {
+    experimentMaterialsRows = [];
+  }
+
+  if (Array.isArray(experimentMaterialsRows) && experimentMaterialsRows.length > 0) {
+    for (const em of experimentMaterialsRows) {
+      const exp = experimentsById.get(String(em.lab_experiment_id));
+      if (!exp) continue;
+      mergeMaterialExperimentLink(mapByMaterial, em.material_name, {
+        experiment_id: exp.experiment_id || null,
+        technology_domain: exp.technology_domain || null,
+        experiment_outcome: exp.experiment_outcome || null,
+        percentage: em.weight_percent != null ? Number(em.weight_percent) : null,
+        unit: '%',
+        sort_order: Number.isFinite(Number(em.sort_order)) ? Number(em.sort_order) : null
+      });
+    }
+  } else {
+    for (const exp of experiments || []) {
+      const names = extractMaterialNamesFromExperimentRow(exp);
+      const percentages = exp && typeof exp.percentages === 'object' && exp.percentages !== null ? exp.percentages : null;
+      for (const name of names) {
+        const pct = percentages && Object.prototype.hasOwnProperty.call(percentages, name) ? percentages[name] : null;
+        mergeMaterialExperimentLink(mapByMaterial, name, {
+          experiment_id: exp.experiment_id || null,
+          technology_domain: exp.technology_domain || null,
+          experiment_outcome: exp.experiment_outcome || null,
+          percentage: typeof pct === 'number' ? pct : null,
+          unit: '%'
+        });
+      }
+    }
+  }
+
+  const materials = [...mapByMaterial.values()]
+    .map((row) => {
+      row.linked_experiments.sort((a, b) => {
+        const sa = Number.isFinite(Number(a.sort_order)) ? Number(a.sort_order) : Number.MAX_SAFE_INTEGER;
+        const sb = Number.isFinite(Number(b.sort_order)) ? Number(b.sort_order) : Number.MAX_SAFE_INTEGER;
+        if (sa !== sb) return sa - sb;
+        return String(a.experiment_id || '').localeCompare(String(b.experiment_id || ''));
+      });
+      row.linked_experiments = row.linked_experiments.map((x) => {
+        const { sort_order, ...rest } = x;
+        return rest;
+      });
+      row.linked_experiments = row.linked_experiments.slice(0, 20);
+      delete row._linkKeys;
+      return row;
+    })
+    .sort((a, b) => String(a.material_name || '').localeCompare(String(b.material_name || '')));
+
+  const totalLinks = materials.reduce((sum, m) => sum + (m.experiment_count || 0), 0);
+  return {
+    materials,
+    stats: {
+      materials_count: materials.length,
+      linked_experiments_count: totalLinks,
+      experiments_count: (experiments || []).length
+    }
+  };
+}
+
+app.get('/api/projects/:projectId/materials-overview', async (req, res) => {
+  try {
+    const ctx = await requireProjectMember(req, res, req.params.projectId);
+    if (!ctx) return;
+    const payload = await buildProjectMaterialsOverview(req.params.projectId);
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Lab analysis: contradictions, failure patterns, snapshot, formula validate, relations, insights, guard ----------
 async function getExperimentsForAnalysis(projectId, options = {}) {
   let q = supabase.from('lab_experiments').select('*').eq('project_id', projectId);
@@ -4327,8 +4486,63 @@ function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
   return s;
 }
 
+function buildProjectMaterialsRagAppendix(materialsOverview) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) return '';
+  const lines = [];
+  for (const row of list.slice(0, 120)) {
+    const name = String(row.material_name || '').trim();
+    if (!name) continue;
+    const role = row.role_or_function ? `; תפקיד: ${String(row.role_or_function).trim()}` : '';
+    const links = Array.isArray(row.linked_experiments) ? row.linked_experiments : [];
+    const linkText = links
+      .slice(0, 6)
+      .map((l) => {
+        const eid = String(l.experiment_id || '').trim();
+        const outcome = String(l.experiment_outcome || '').trim();
+        const pct = typeof l.percentage === 'number' ? ` ${l.percentage}${l.unit || '%'}` : '';
+        return [eid, outcome ? `(${outcome}${pct ? `,${pct}` : ''})` : pct ? `(${pct.trim()})` : ''].filter(Boolean).join(' ');
+      })
+      .filter(Boolean)
+      .join(', ');
+    lines.push(`- חומר: ${name}${role}${linkText ? `; ניסויים מקושרים: ${linkText}` : ''}`);
+  }
+  if (lines.length === 0) return '';
+  return `\n\nPROJECT STRUCTURED CONTEXT (materials dictionary + experiment links):\n${lines.join('\n')}`;
+}
+
+function buildProjectMaterialGroundingSnippets(materialsOverview, query) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) return [];
+  const qToks = tokenizeGptRagEvidence(String(query || ''));
+  const snippets = list.map((row, idx) => {
+    const name = String(row.material_name || '').trim();
+    if (!name) return null;
+    const links = Array.isArray(row.linked_experiments) ? row.linked_experiments : [];
+    const role = row.role_or_function ? `תפקיד: ${String(row.role_or_function).trim()}. ` : '';
+    const linkText = links
+      .slice(0, 12)
+      .map((l) => {
+        const eid = String(l.experiment_id || '').trim() || 'לא צוין';
+        const domain = String(l.technology_domain || '').trim();
+        const outcome = String(l.experiment_outcome || '').trim();
+        const pct = typeof l.percentage === 'number' ? `${l.percentage}${l.unit || '%'}` : '';
+        return `ניסוי ${eid}${domain ? `, תחום ${domain}` : ''}${outcome ? `, תוצאה ${outcome}` : ''}${pct ? `, אחוז ${pct}` : ''}`;
+      })
+      .join('; ');
+    const text = `חומר: ${name}. ${role}${linkText || 'אין כרגע קישורים לניסויים.'}`.trim();
+    const score = scoreGptRagSnippet(text.toLowerCase(), qToks, []);
+    return { filename: 'Material Library (Project)', text, _score: score, _idx: idx };
+  }).filter(Boolean);
+  snippets.sort((a, b) => b._score - a._score || a._idx - b._idx);
+  const maxItems = 10;
+  const hasPositive = snippets.some((s) => s._score > 0);
+  const picked = hasPositive ? snippets.filter((s) => s._score > 0).slice(0, maxItems) : snippets.slice(0, maxItems);
+  return picked.map((s) => ({ filename: s.filename, text: s.text }));
+}
+
 /**
- * User-visible answer for project GPT RAG: built only from snippets that match live project_files.
+ * User-visible answer for project GPT RAG: built from grounded snippets (live project files + project structured context).
  * The first Responses API message may reflect stale files still attached in OpenAI; do not use it as synthesis.
  */
 async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts = {}) {
@@ -4562,6 +4776,13 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       return res.status(400).json({ error: 'No selected files found in this project scope.' });
     }
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
+    let materialsOverview = { materials: [], stats: { materials_count: 0, linked_experiments_count: 0, experiments_count: 0 } };
+    try {
+      materialsOverview = await buildProjectMaterialsOverview(projectId);
+    } catch (e) {
+      console.warn('[gpt-rag/query] materials overview unavailable:', e.message);
+    }
+    const materialsAppendix = buildProjectMaterialsRagAppendix(materialsOverview);
     const languageAppendix =
       userLang === 'he'
         ? '\n\nLANGUAGE: Reply in Hebrew (עברית).'
@@ -4571,7 +4792,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const payload = {
       model: OPENAI_RAG_MODEL,
       instructions: GPT_RAG_QUERY_INSTRUCTIONS + languageAppendix,
-      input: q + catalogAppendix,
+      input: q + catalogAppendix + materialsAppendix,
       tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: 24 }],
       include: ['file_search_call.results']
     };
@@ -4582,7 +4803,9 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     });
 
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
-    const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
+    const fileSnippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
+    const materialSnippets = buildProjectMaterialGroundingSnippets(materialsOverview, q);
+    const snippets = [...fileSnippets, ...materialSnippets];
     const hasUsableSnippets =
       Array.isArray(snippets) &&
       snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
@@ -4590,7 +4813,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     let synthesis = noSupportMessage;
     if (hasUsableSnippets) {
       try {
-        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, snippets, {
+        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix + materialsAppendix, snippets, {
           lang: userLang,
           noSupport: noSupportMessage
         });
