@@ -95,6 +95,20 @@ STRICT GROUNDING:
 
 FILE NAMES: List may include indexed names — prioritize a named file when the user asks about it. Cite source filenames for excerpts.
 
+MEASUREMENTS SCHEMA (Phase B):
+- For measurement questions, treat values as structured fields: type/value/unit/rpm/temp.
+- Compare values directly only when unit + conditions are compatible (especially cps at the same rpm unless explicit normalization is stated).
+- If unit/conditions are missing or incompatible, state that direct comparison is not valid from the retrieved evidence.
+
+RAG-EXPERIMENT LINK (Phase B):
+- If the query includes a block marked [נתוני ניסויים מובנים — ...], treat it as first-class project evidence and prioritize it for viscosity/pH/rpm/temp numeric claims.
+- Use file_search excerpts to supplement only where the structured block does not answer fully.
+
+DOCUMENT CLASSIFICATION (Phase B):
+- Classify evidence text as formulation / experiment_result / qc_data before drawing conclusions.
+- For measured outcomes (e.g. viscosity, pH), prioritize experiment_result / qc_data evidence over formulation-only text.
+- If classification is ambiguous, say so explicitly and avoid guessing.
+
 COMPARISON / A vs B / השוואה עם אחוזים: When the user asks to compare two formulations or versions (percentages, composition, Δ / delta / הפרש):
 - Answer with one GitHub-flavored Markdown table: columns must include the component name, % for version A, % for version B, and Δ as the signed difference in percentage points (B−A), using ONLY numbers that appear in the retrieved excerpts.
 - If a component appears in only one version, show "—" for the missing side and omit or "—" for Δ unless both percents are present.
@@ -4370,6 +4384,8 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets) {
     'ענו בעברית בלבד (אלא אם המשתמש ביקש במפורש שפה אחרת). ' +
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
+    'לשאלות מדידה: התייחסו לנתונים כסכימה type/value/unit/rpm/temp; השוואה מספרית רק כאשר unit+conditions תואמים (במיוחד cps באותו rpm אלא אם מצוין נרמול). אם לא תואם/חסר — ציינו שאין השוואה ישירה מהציטוטים. ' +
+    'לפני מסקנה, סווגו ציטוטים כ-formulation / experiment_result / qc_data לפי הטקסט; לתוצאות מדודות (viscosity/pH) תעדפו experiment_result/qc_data. אם הסיווג לא ודאי — ציינו זאת. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
     'אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: אין במערכת מידע תומך לשאלה זו.\n\nציטוטים:\n' +
     context;
@@ -4572,24 +4588,19 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const projectId = req.params.projectId;
     const ctx = await requireProjectMember(req, res, projectId);
     if (!ctx) return;
-    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
     const q = (req.body && String(req.body.query || '').trim()) || '';
     if (!q) return res.status(400).json({ error: 'query is required' });
 
-    const { data: project, error } = await supabase.from('projects').select('openai_vector_store_id').eq('id', projectId).single();
-    if (error || !project) return res.status(404).json({ error: 'Project not found' });
-    const vsId = project.openai_vector_store_id;
-    if (!vsId) return res.status(400).json({ error: 'No GPT vector store yet. Sync project files to OpenAI from the Documents tab first.' });
-
-    try {
-      await verifyOpenAiVectorStoreMatchesProject(vsId, projectId);
-    } catch (verErr) {
-      const st = verErr.statusCode || 500;
-      return res.status(st).json({ error: verErr.message || 'Vector store verification failed' });
-    }
-
+    const rag = await getLocalRag();
+    if (!rag) return res.status(503).json({ error: 'Local RAG not available' });
     const catalogRows = await listProjectFileCatalogRows(projectId);
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows);
+    const scopeFilenames = [...new Set(
+      (catalogRows || [])
+        .map((r) => String(r?.original_name || '').trim() || path.basename(String(r?.storage_path || '').replace(/\\/g, '/')))
+        .filter(Boolean)
+    )];
+    const filterMetadata = scopeFilenames.length > 0 ? { filenames: scopeFilenames } : null;
 
     const mq = parseMeasurementQuestion(q);
     let experimentPreface = '';
@@ -4602,22 +4613,15 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const inputWithExperiments =
       (experimentPreface ? experimentPreface + '\n\n---\n\n' : '') + q + catalogAppendix;
 
-    // Single vector store for this project only (sync uploads only project_files for this project_id).
-    const payload = {
-      model: OPENAI_RAG_MODEL,
-      instructions: GPT_RAG_QUERY_INSTRUCTIONS,
-      input: inputWithExperiments,
-      tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: GPT_RAG_FILE_SEARCH_MAX_RESULTS }],
-      include: ['file_search_call.results']
-    };
-
-    const r = await axios.post(`${OPENAI_API_BASE}/responses`, payload, {
-      headers: openAiJsonHeaders(),
-      timeout: 120000
-    });
-
-    const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
-    const snippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows);
+    const out = await rag.generateAnswer(q, 20, filterMetadata, true);
+    const snippets = Array.isArray(out?.results)
+      ? out.results
+          .map((r) => ({
+            filename: r?.metadata?.filename || 'Unknown',
+            text: String(r?.document || r?.text || '').trim()
+          }))
+          .filter((s) => s.text.length > 0)
+      : [];
     const mergedSnippets =
       experimentPreface.trim().length > 0
         ? [{ filename: 'ניסויים (מסד נתונים)', text: experimentPreface }, ...snippets]
@@ -4626,27 +4630,19 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       Array.isArray(mergedSnippets) &&
       mergedSnippets.some((s) => String(s.text || s.content || '').trim().length > 0);
 
-    let synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
-    if (hasUsableSnippets) {
-      try {
-        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, mergedSnippets);
-      } catch (e) {
-        console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
-        synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
-      }
-      if (!synthesis || synthesis.length < 2) synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
-    }
+    let synthesis = String(out?.answer || '').trim();
+    if (!synthesis || synthesis.length < 2) synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
     const sources = hasUsableSnippets ? dedupeAndCapSources(mergedSnippets, q, synthesis) : [];
     res.json({
-      run_id: r.data?.id || crypto.randomUUID(),
+      run_id: crypto.randomUUID(),
       outputs: { synthesis, research: synthesis, analysis: synthesis },
       justifications: [],
       sources,
       experiment_rag_used: Boolean(experimentPreface.trim())
     });
   } catch (e) {
-    console.error('[gpt-rag/query]', e.response?.data || e.message);
-    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message || 'Query failed' });
+    console.error('[gpt-rag/query]', e.message);
+    res.status(500).json({ error: e.message || 'Query failed' });
   }
 });
 
