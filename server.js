@@ -86,6 +86,16 @@ The vector store is exclusively this user's current project — never treat cont
 
 FAIL-SAFE (deterministic): If file_search returns no usable excerpt text, respond with this single Hebrew sentence only — no bullet lists, no recommendations, no next steps, no "however" or alternatives:
 אין במערכת מידע תומך לשאלה זו.`;
+
+function detectProjectGptUserLanguage(text) {
+  return /[\u0590-\u05FF]/.test(String(text || '')) ? 'he' : 'en';
+}
+
+function projectGptNoSupportMessage(lang) {
+  return lang === 'he'
+    ? RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE
+    : 'There is no supporting information in the system for this question.';
+}
 const RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
 /** Verified-domain sender in Resend. Set RESEND_FROM_EMAIL (e.g. noreply@yourdomain.com). Default is sandbox only. */
 const RESEND_FROM_EMAIL = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
@@ -4306,9 +4316,11 @@ function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
  * User-visible answer for project GPT RAG: built only from snippets that match live project_files.
  * The first Responses API message may reflect stale files still attached in OpenAI; do not use it as synthesis.
  */
-async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets) {
+async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts = {}) {
   const key = OPENAI_API_KEY;
   if (!key) return '';
+  const lang = opts.lang === 'en' ? 'en' : 'he';
+  const noSupport = String(opts.noSupport || projectGptNoSupportMessage(lang));
   const list = Array.isArray(snippets) ? snippets : [];
   const parts = list.slice(0, 12).map((s, i) => {
     const fn = String(s.filename || 'Unknown');
@@ -4318,11 +4330,11 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets) {
   const context = parts.join('\n\n---\n\n');
   if (!context.trim()) return '';
   const systemContent =
-    'ענו בעברית בלבד (אלא אם המשתמש ביקש במפורש שפה אחרת). ' +
+    `Reply in ${lang === 'he' ? 'Hebrew' : 'English'} only. ` +
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
-    'אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: אין במערכת מידע תומך לשאלה זו.\n\nציטוטים:\n' +
+    `אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: ${noSupport}\n\nציטוטים:\n` +
     context;
   const r = await axios.post(
     `${OPENAI_API_BASE}/chat/completions`,
@@ -4501,6 +4513,11 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     if (!ctx) return;
     if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
     const q = (req.body && String(req.body.query || '').trim()) || '';
+    const userLang = detectProjectGptUserLanguage(q);
+    const noSupportMessage = projectGptNoSupportMessage(userLang);
+    const onlyProjectFileIds = Array.isArray(req.body?.only_project_file_ids)
+      ? req.body.only_project_file_ids.map((x) => String(x || '').trim()).filter(Boolean)
+      : [];
     if (!q) return res.status(400).json({ error: 'query is required' });
 
     const { data: project, error } = await supabase.from('projects').select('openai_vector_store_id').eq('id', projectId).single();
@@ -4515,18 +4532,29 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       return res.status(st).json({ error: verErr.message || 'Vector store verification failed' });
     }
 
-    const { data: catalogRows } = await supabase
+    let catalogQuery = supabase
       .from('project_files')
-      .select('original_name, storage_path')
+      .select('id, original_name, storage_path')
       .eq('project_id', projectId)
       .order('created_at', { ascending: false })
       .limit(200);
+    if (onlyProjectFileIds.length > 0) {
+      catalogQuery = catalogQuery.in('id', onlyProjectFileIds);
+    }
+    const { data: catalogRows } = await catalogQuery;
+    if (onlyProjectFileIds.length > 0 && (!Array.isArray(catalogRows) || catalogRows.length === 0)) {
+      return res.status(400).json({ error: 'No selected files found in this project scope.' });
+    }
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
+    const languageAppendix =
+      userLang === 'he'
+        ? '\n\nLANGUAGE: Reply in Hebrew (עברית).'
+        : '\n\nLANGUAGE: Reply in English.';
 
     // Single vector store for this project only (sync uploads only project_files for this project_id).
     const payload = {
       model: OPENAI_RAG_MODEL,
-      instructions: GPT_RAG_QUERY_INSTRUCTIONS,
+      instructions: GPT_RAG_QUERY_INSTRUCTIONS + languageAppendix,
       input: q + catalogAppendix,
       tools: [{ type: 'file_search', vector_store_ids: [vsId], max_num_results: 24 }],
       include: ['file_search_call.results']
@@ -4543,15 +4571,18 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       Array.isArray(snippets) &&
       snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
 
-    let synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+    let synthesis = noSupportMessage;
     if (hasUsableSnippets) {
       try {
-        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, snippets);
+        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix, snippets, {
+          lang: userLang,
+          noSupport: noSupportMessage
+        });
       } catch (e) {
         console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
-        synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+        synthesis = noSupportMessage;
       }
-      if (!synthesis || synthesis.length < 2) synthesis = RAG_INSUFFICIENT_SUPPORT_MESSAGE_HE;
+      if (!synthesis || synthesis.length < 2) synthesis = noSupportMessage;
     }
     const sources = hasUsableSnippets ? dedupeAndCapSources(snippets, q, synthesis) : [];
     res.json({
