@@ -4465,6 +4465,9 @@ function collectFileSearchSnippetsFromResponse(data) {
 
 const GPT_RAG_SOURCE_EXCERPT_MAX = 4000;
 const GPT_RAG_SOURCES_UI_MAX = 6;
+const PROJECT_GPT_EXCEL_CONTEXT_PREAMBLE =
+  '[גיליון: תוכן טבלאי מאקסל] ' +
+  'השורות עשויות להיות בפורמט מופרד טאבים/פסיקים; זהו תוכן מסמך תקף שיש לפרש לפי כותרות/עמודות/ערכים בלבד.';
 
 function tokenizeGptRagEvidence(text) {
   if (!text || typeof text !== 'string') return [];
@@ -4484,6 +4487,22 @@ function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
     if (t.length >= 3 && snippetLower.includes(t)) s += 1;
   }
   return s;
+}
+
+function isSpreadsheetLikeFilename(name) {
+  const base = String(name || '').split(/[\\/]/).filter(Boolean).pop() || '';
+  return /\.xlsx$/i.test(base) || /\.xls$/i.test(base) || /\.csv$/i.test(base);
+}
+
+function snippetLooksSpreadsheet(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  return (
+    /\[גיליון:/.test(t) ||
+    /Unnamed:\s*\d+/i.test(t) ||
+    /\bindex,\d/i.test(t) ||
+    t.includes('\t')
+  );
 }
 
 function escapeRegExp(s) {
@@ -4746,18 +4765,32 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
   const lang = opts.lang === 'en' ? 'en' : 'he';
   const noSupport = String(opts.noSupport || projectGptNoSupportMessage(lang));
   const list = Array.isArray(snippets) ? snippets : [];
-  const parts = list.slice(0, 12).map((s, i) => {
+  const spreadsheetMode = list.some((s) => {
+    const fn = String(s?.filename || '');
+    const body = String(s?.text || s?.content || '');
+    return isSpreadsheetLikeFilename(fn) || snippetLooksSpreadsheet(body);
+  });
+  const maxParts = spreadsheetMode ? 18 : 12;
+  const parts = list.slice(0, maxParts).map((s, i) => {
     const fn = String(s.filename || 'Unknown');
-    const body = String(s.text || s.content || '').trim().slice(0, 7000);
-    return `קטע ${i + 1} (מקור: ${fn}):\n${body}`;
+    const rawBody = String(s.text || s.content || '').trim().slice(0, 7000);
+    const pre = isSpreadsheetLikeFilename(fn) || snippetLooksSpreadsheet(rawBody)
+      ? `${PROJECT_GPT_EXCEL_CONTEXT_PREAMBLE}\n`
+      : '';
+    return `קטע ${i + 1} (מקור: ${fn}):\n${pre}${rawBody}`;
   });
   const context = parts.join('\n\n---\n\n');
   if (!context.trim()) return '';
+  const spreadsheetHint = spreadsheetMode
+    ? '\n\nSpreadsheets: snippet lines may be tab/comma separated rows from Excel and can include sheet markers. ' +
+      'Treat this as valid structured document content. Answer from columns/headers/values that appear in snippets; do not ignore spreadsheet rows.\n'
+    : '';
   const systemContent =
     `Reply in ${lang === 'he' ? 'Hebrew' : 'English'} only. ` +
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
+    spreadsheetHint +
     `${RAG_MEASUREMENT_SCHEMA_RULES} ` +
     `אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: ${noSupport}\n\nציטוטים:\n` +
     context;
@@ -4769,8 +4802,8 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
         { role: 'system', content: systemContent },
         { role: 'user', content: String(userQuery || '').trim().slice(0, 12000) }
       ],
-      max_tokens: 1024,
-      temperature: 0.2
+      max_tokens: spreadsheetMode ? 2048 : 1024,
+      temperature: spreadsheetMode ? 0.25 : 0.2
     },
     {
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
