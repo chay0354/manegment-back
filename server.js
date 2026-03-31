@@ -85,6 +85,8 @@ GENERAL / OVERVIEW questions (e.g. what the document is about, main theme): You 
 STRICT GROUNDING:
 - Use ONLY content from file_search for this project's vector store plus structured project snippets supplied in the same request.
 - Do NOT use general knowledge, training data, or the web for facts (products, materials, formulas, regulations, etc.).
+- Evidence gate: If no experiment outcome evidence is present, DO NOT infer impact/causality/explanations.
+- In no-outcome mode, allow only factual outputs: materials list, percentages, and deltas directly present in evidence.
 
 FILE NAMES: List may include indexed names — prioritize a named file when the user asks about it. Cite source filenames for excerpts.
 
@@ -4619,6 +4621,74 @@ function detectMaterialsIntent(query) {
   return /(חומר|חומרים|תפקיד|פונקציה|מרכיב|רכיב|material|materials|ingredient|ingredients|role|function)/i.test(q);
 }
 
+function detectImpactOrCausalIntent(query) {
+  const q = String(query || '').trim();
+  if (!q) return false;
+  return /(השפעה|משפיע|השפיע|סיבה|גורם|סיבתי|למה|מדוע|איך זה עובד|impact|influence|affect|effect|causal|cause|why|explain)/i.test(
+    q
+  );
+}
+
+function hasMaterialOutcomeEvidence(materialsOverview) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  for (const row of list) {
+    const links = Array.isArray(row?.linked_experiments) ? row.linked_experiments : [];
+    for (const l of links) {
+      const out = String(l?.experiment_outcome || '').trim();
+      if (out) return true;
+    }
+  }
+  return false;
+}
+
+function buildDeterministicMaterialFactsAnswer(materialsOverview, userLang) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) {
+    return userLang === 'he'
+      ? 'אין נתוני חומרים זמינים כרגע לפרויקט.'
+      : 'No material data is currently available for this project.';
+  }
+
+  const lines = [];
+  for (const row of list.slice(0, 80)) {
+    const name = String(row?.material_name || '').trim();
+    if (!name) continue;
+    const role = String(row?.role_or_function || '').trim();
+    const links = Array.isArray(row?.linked_experiments) ? row.linked_experiments : [];
+    const pcts = links
+      .map((l) => (typeof l?.percentage === 'number' && Number.isFinite(l.percentage) ? Number(l.percentage) : null))
+      .filter((v) => Number.isFinite(v));
+    const pctPart =
+      pcts.length > 0
+        ? userLang === 'he'
+          ? `אחוזים: ${pcts.map((v) => `${formatPercentValue(v)}%`).join(', ')}`
+          : `percentages: ${pcts.map((v) => `${formatPercentValue(v)}%`).join(', ')}`
+        : userLang === 'he'
+          ? 'אחוזים: לא זמין'
+          : 'percentages: not available';
+    const deltaPart =
+      pcts.length >= 2
+        ? (() => {
+            const min = Math.min(...pcts);
+            const max = Math.max(...pcts);
+            const d = formatPercentValue(max - min);
+            return userLang === 'he' ? `Delta: ${d} נק׳ אחוז` : `Delta: ${d} pp`;
+          })()
+        : userLang === 'he'
+          ? 'Delta: לא זמין'
+          : 'Delta: not available';
+    if (userLang === 'he') lines.push(`- ${name}${role ? ` (תפקיד: ${role})` : ''} | ${pctPart} | ${deltaPart}`);
+    else lines.push(`- ${name}${role ? ` (role: ${role})` : ''} | ${pctPart} | ${deltaPart}`);
+  }
+  if (lines.length === 0) {
+    return userLang === 'he'
+      ? 'אין נתוני חומרים זמינים כרגע לפרויקט.'
+      : 'No material data is currently available for this project.';
+  }
+  if (userLang === 'he') return `נתונים עובדתיים מחומרים (ללא inference):\n${lines.join('\n')}`;
+  return `Material factual data (no inference):\n${lines.join('\n')}`;
+}
+
 function buildProjectMaterialsMetadataContext(materialsOverview) {
   const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
   if (list.length === 0) return '';
@@ -4642,7 +4712,18 @@ function buildProjectMaterialsMetadataContext(materialsOverview) {
       })
       .filter(Boolean)
       .join(' | ');
-    lines.push(`- חומר: ${name}${role ? ` | תפקיד: ${role}` : ''}${linkText ? ` | קישורים: ${linkText}` : ''}`);
+    const outcomes = links
+      .map((l) => String(l?.experiment_outcome || '').trim())
+      .filter(Boolean);
+    const uniqueOutcomes = [...new Set(outcomes)];
+    lines.push(
+      [
+        `- material: ${name}${role ? ` | role_or_function: ${role}` : ''}`,
+        '  formulation: (not present in material-library context)',
+        `  experiment: ${linkText || '(no linked experiment rows)'}`,
+        `  outcome: ${uniqueOutcomes.length ? uniqueOutcomes.join(', ') : '(none)'}`
+      ].join('\n')
+    );
   }
   return lines.join('\n');
 }
@@ -4652,6 +4733,7 @@ async function projectGptMaterialsSynthesisFromMetadata(userQuery, materialsOver
   if (!key) return '';
   const lang = opts.lang === 'en' ? 'en' : 'he';
   const noSupport = String(opts.noSupport || projectGptNoSupportMessage(lang));
+  const noOutcomeEvidence = Boolean(opts.noOutcomeEvidence);
   const metaContext = buildProjectMaterialsMetadataContext(materialsOverview);
   if (!metaContext.trim()) return '';
 
@@ -4660,8 +4742,12 @@ async function projectGptMaterialsSynthesisFromMetadata(userQuery, materialsOver
     'אתה שכבת תשובה ייעודית לשאלות חומרים בפרויקט. ' +
     'השתמש אך ורק במטא־דאטה של ספריית החומרים שסופק כאן. ' +
     'אסור להמציא, אסור להשתמש בידע חיצוני, אסור להסיק מעבר למה שמופיע. ' +
+    'שמור הפרדה בין שכבות data: material / formulation / experiment / outcome. ' +
     'אם המשתמש ביקש רשימה — החזר רשימה ברורה של חומרים ותפקיד (אם קיים). ' +
     'אם נשאל על חומר ספציפי — התמקד בו, והצג תפקיד/ניסויים מקושרים רק אם מופיעים בהקשר. ' +
+    (noOutcomeEvidence
+      ? 'אין evidence של outcome: אסור להחזיר השפעה/הסבר/קשר סיבתי. מותר רק עובדות: חומרים, אחוזים, Delta.'
+      : '') +
     `אם אין מידע תומך, החזר בדיוק: ${noSupport}\n\n` +
     `PROJECT MATERIALS METADATA:\n${metaContext}`;
 
@@ -4764,6 +4850,7 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
   if (!key) return '';
   const lang = opts.lang === 'en' ? 'en' : 'he';
   const noSupport = String(opts.noSupport || projectGptNoSupportMessage(lang));
+  const noOutcomeEvidence = Boolean(opts.noOutcomeEvidence);
   const list = Array.isArray(snippets) ? snippets : [];
   const spreadsheetMode = list.some((s) => {
     const fn = String(s?.filename || '');
@@ -4789,6 +4876,9 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
     `Reply in ${lang === 'he' ? 'Hebrew' : 'English'} only. ` +
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
+    (noOutcomeEvidence
+      ? 'אין evidence ל-outcome בניסוי: אסור להסיק השפעה/סיבתיות/הסברים. מותר רק עובדות: חומרים, אחוזים ו-Delta מהציטוטים.'
+      : '') +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
     spreadsheetHint +
     `${RAG_MEASUREMENT_SCHEMA_RULES} ` +
@@ -5045,11 +5135,17 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     let synthesis = noSupportMessage;
     if (hasUsableSnippets) {
       const materialIntent = detectMaterialsIntent(q);
-      if (materialIntent) {
+      const causalIntent = detectImpactOrCausalIntent(q);
+      const noOutcomeEvidence = !hasMaterialOutcomeEvidence(materialsOverview);
+      if (materialIntent && causalIntent && noOutcomeEvidence) {
+        synthesis = buildDeterministicMaterialFactsAnswer(materialsOverview, userLang);
+      }
+      if (materialIntent && (!synthesis || synthesis === noSupportMessage)) {
         try {
           const materialSynthesis = await projectGptMaterialsSynthesisFromMetadata(q, materialsOverview, {
             lang: userLang,
-            noSupport: noSupportMessage
+            noSupport: noSupportMessage,
+            noOutcomeEvidence
           });
           if (materialSynthesis && materialSynthesis.length >= 2) synthesis = materialSynthesis;
         } catch (e) {
@@ -5071,7 +5167,8 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
             try {
               synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix + materialsAppendix, snippets, {
                 lang: userLang,
-                noSupport: noSupportMessage
+                noSupport: noSupportMessage,
+                noOutcomeEvidence
               });
             } catch (e) {
               console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
