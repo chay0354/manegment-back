@@ -71,6 +71,7 @@ const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 מותר: לקחת כמה ציטוטים מתוצאות file_search ומהקשר מובנה של הפרויקט (ספריית חומרים/קישור ניסוי→חומר); לקצר אותם; לארגן אותם למשפטים ברורים.
 אסור: להוסיף מידע שלא מופיע בציטוטים או בהקשר המובנה שסופק; להשלים פערים; להסיק מעבר למה שכתוב.
 כלומר: התשובה = טרנספורמציה של הציטוטים בלבד — בלי עובדות שלא ניתן לקשר ישירות לטקסט שמוצג כציטוט.
+כאשר יש אי-התאמה בין קבצים לבין "Project Metadata (Material Library)" לגבי שיוך חומרים/role_or_function — להעדיף את Project Metadata כמקור סמכות.
 
 דירוג / «מה הכי טוב» / המלצה: אסור לקבוע פורמולה מנצחת, «מומלץ» או עדיפות אלא אם ציטוט מהמסמכים אומר זאת במפורש; אחרת תיאור ניטרלי מן הציטוטים בלבד או משפט ה-FAIL-SAFE למטה.
 
@@ -4541,6 +4542,73 @@ function buildProjectMaterialGroundingSnippets(materialsOverview, query) {
   return picked.map((s) => ({ filename: s.filename, text: s.text }));
 }
 
+function buildProjectMaterialsSummarySnippet(materialsOverview) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) return null;
+  const lines = [
+    'SOURCE_TYPE: material_library',
+    'PRIORITY: highest_for_material_questions',
+    'Material library (authoritative project metadata):'
+  ];
+  for (const row of list.slice(0, 180)) {
+    const name = String(row.material_name || '').trim();
+    if (!name) continue;
+    const role = row.role_or_function ? ` | role_or_function: ${String(row.role_or_function).trim()}` : '';
+    const links = Array.isArray(row.linked_experiments) ? row.linked_experiments : [];
+    const linkText = links
+      .slice(0, 6)
+      .map((l) => {
+        const eid = String(l.experiment_id || '').trim() || 'n/a';
+        const outcome = String(l.experiment_outcome || '').trim();
+        const pct = typeof l.percentage === 'number' ? `${l.percentage}${l.unit || '%'}` : '';
+        return `exp=${eid}${outcome ? `, outcome=${outcome}` : ''}${pct ? `, pct=${pct}` : ''}`;
+      })
+      .join('; ');
+    lines.push(`- material: ${name}${role}${linkText ? ` | links: ${linkText}` : ''}`);
+  }
+  return { filename: 'Project Metadata (Material Library)', text: lines.join('\n') };
+}
+
+function buildProjectGroundingSnippets(fileSnippets, materialSnippets, query) {
+  const qToks = tokenizeGptRagEvidence(String(query || ''));
+  const toRow = (s, idx, sourceType) => {
+    const text = String(s?.text || s?.content || '').trim();
+    if (!text) return null;
+    const base = scoreGptRagSnippet(text.toLowerCase(), qToks, []);
+    const sourceBoost = sourceType === 'material_library' ? 2 : 0;
+    return {
+      filename: String(s?.filename || 'Unknown'),
+      text,
+      _score: base + sourceBoost,
+      _sourceType: sourceType,
+      _idx: idx
+    };
+  };
+  const rows = [];
+  (Array.isArray(materialSnippets) ? materialSnippets : []).forEach((s, i) => {
+    const row = toRow(s, i, 'material_library');
+    if (row) rows.push(row);
+  });
+  (Array.isArray(fileSnippets) ? fileSnippets : []).forEach((s, i) => {
+    const row = toRow(s, i + 10000, 'file_search');
+    if (row) rows.push(row);
+  });
+  rows.sort((a, b) => b._score - a._score || a._idx - b._idx);
+
+  // Keep context tight but always keep at least one material snippet when available.
+  const cap = 12;
+  const picked = rows.slice(0, cap);
+  const hasMaterial = picked.some((r) => r._sourceType === 'material_library');
+  if (!hasMaterial) {
+    const firstMaterial = rows.find((r) => r._sourceType === 'material_library');
+    if (firstMaterial) {
+      if (picked.length >= cap) picked[picked.length - 1] = firstMaterial;
+      else picked.push(firstMaterial);
+    }
+  }
+  return picked.map((r) => ({ filename: r.filename, text: r.text }));
+}
+
 /**
  * User-visible answer for project GPT RAG: built from grounded snippets (live project files + project structured context).
  * The first Responses API message may reflect stale files still attached in OpenAI; do not use it as synthesis.
@@ -4563,6 +4631,9 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
+    'אם קיימים ציטוטים שמקורם "Project Metadata (Material Library)" והשאלה עוסקת בחומרים/שיוך חומרים לפרויקט/role_or_function — יש להשתמש במקור זה כמקור סמכות ראשי. ' +
+    'במצב כזה אסור להוסיף חומרים שלא מופיעים ב-Project Metadata גם אם הם מופיעים בקבצים אחרים, אלא לציין במפורש שהם אינם ברשימת הספרייה. ' +
+    'כאשר המשתמש מבקש "לפי רשימת חומרים" או "מהספרייה", התשובה חייבת להתבסס על Project Metadata בלבד. ' +
     `${RAG_MEASUREMENT_SCHEMA_RULES} ` +
     `אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: ${noSupport}\n\nציטוטים:\n` +
     context;
@@ -4741,7 +4812,6 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const projectId = req.params.projectId;
     const ctx = await requireProjectMember(req, res, projectId);
     if (!ctx) return;
-    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
     const q = (req.body && String(req.body.query || '').trim()) || '';
     const userLang = detectProjectGptUserLanguage(q);
     const noSupportMessage = projectGptNoSupportMessage(userLang);
@@ -4749,6 +4819,16 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       ? req.body.only_project_file_ids.map((x) => String(x || '').trim()).filter(Boolean)
       : [];
     if (!q) return res.status(400).json({ error: 'query is required' });
+
+    let materialsOverview = { materials: [], stats: { materials_count: 0, linked_experiments_count: 0, experiments_count: 0 } };
+    try {
+      materialsOverview = await buildProjectMaterialsOverview(projectId);
+    } catch (e) {
+      console.warn('[gpt-rag/query] materials overview unavailable:', e.message);
+    }
+    const materialsAppendix = buildProjectMaterialsRagAppendix(materialsOverview);
+
+    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
 
     const { data: project, error } = await supabase.from('projects').select('openai_vector_store_id').eq('id', projectId).single();
     if (error || !project) return res.status(404).json({ error: 'Project not found' });
@@ -4776,13 +4856,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       return res.status(400).json({ error: 'No selected files found in this project scope.' });
     }
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
-    let materialsOverview = { materials: [], stats: { materials_count: 0, linked_experiments_count: 0, experiments_count: 0 } };
-    try {
-      materialsOverview = await buildProjectMaterialsOverview(projectId);
-    } catch (e) {
-      console.warn('[gpt-rag/query] materials overview unavailable:', e.message);
-    }
-    const materialsAppendix = buildProjectMaterialsRagAppendix(materialsOverview);
+
     const languageAppendix =
       userLang === 'he'
         ? '\n\nLANGUAGE: Reply in Hebrew (עברית).'
@@ -4805,7 +4879,9 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
     const fileSnippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
     const materialSnippets = buildProjectMaterialGroundingSnippets(materialsOverview, q);
-    const snippets = [...fileSnippets, ...materialSnippets];
+    const materialSummary = buildProjectMaterialsSummarySnippet(materialsOverview);
+    const allMaterialSnippets = materialSummary ? [materialSummary, ...materialSnippets] : materialSnippets;
+    const snippets = buildProjectGroundingSnippets(fileSnippets, allMaterialSnippets, q);
     const hasUsableSnippets =
       Array.isArray(snippets) &&
       snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
