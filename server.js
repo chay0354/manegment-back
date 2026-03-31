@@ -71,7 +71,6 @@ const GPT_RAG_QUERY_INSTRUCTIONS = `You are the project document Q&A engine.
 מותר: לקחת כמה ציטוטים מתוצאות file_search ומהקשר מובנה של הפרויקט (ספריית חומרים/קישור ניסוי→חומר); לקצר אותם; לארגן אותם למשפטים ברורים.
 אסור: להוסיף מידע שלא מופיע בציטוטים או בהקשר המובנה שסופק; להשלים פערים; להסיק מעבר למה שכתוב.
 כלומר: התשובה = טרנספורמציה של הציטוטים בלבד — בלי עובדות שלא ניתן לקשר ישירות לטקסט שמוצג כציטוט.
-כאשר יש אי-התאמה בין קבצים לבין "Project Metadata (Material Library)" לגבי שיוך חומרים/role_or_function — להעדיף את Project Metadata כמקור סמכות.
 
 דירוג / «מה הכי טוב» / המלצה: אסור לקבוע פורמולה מנצחת, «מומלץ» או עדיפות אלא אם ציטוט מהמסמכים אומר זאת במפורש; אחרת תיאור ניטרלי מן הציטוטים בלבד או משפט ה-FAIL-SAFE למטה.
 
@@ -4487,6 +4486,185 @@ function scoreGptRagSnippet(snippetLower, queryToks, answerToks) {
   return s;
 }
 
+function escapeRegExp(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatPercentValue(v) {
+  if (!Number.isFinite(v)) return null;
+  const rounded = Math.round(v * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded).replace(/\.?0+$/, '');
+}
+
+function detectQuantityIntent(query) {
+  const q = String(query || '').trim();
+  if (!q) return null;
+  const quantityIntentRe =
+    /(מה\s+הכמות\s+של|כמה\s+אחוז|אחוז(?:ים)?\s+של|what\s+is\s+the\s+(?:amount|quantity|percent|percentage)\s+of|how\s+much\s+of)/i;
+  if (!quantityIntentRe.test(q)) return null;
+
+  const quoted = q.match(/["'“”]([^"'“”]{2,120})["'“”]/);
+  if (quoted && quoted[1]) return quoted[1].trim();
+  const byOf = q.match(/(?:של|of)\s+([A-Za-z0-9_\-./ ]{2,120})$/i) || q.match(/(?:של|of)\s+([A-Za-z0-9_\-./ ]{2,120})/i);
+  if (byOf && byOf[1]) return byOf[1].trim();
+  return null;
+}
+
+function parsePercentFromSnippetWindow(windowText) {
+  const txt = String(windowText || '');
+  if (!txt) return null;
+  const numRe = /[-+]?\d+(?:[.,]\d+)?/g;
+  let m;
+  while ((m = numRe.exec(txt)) !== null) {
+    const raw = String(m[0]).replace(',', '.');
+    const n = Number(raw);
+    if (!Number.isFinite(n)) continue;
+    if (Math.abs(n) > 100000) continue;
+
+    const around = txt.slice(Math.max(0, m.index - 8), Math.min(txt.length, m.index + m[0].length + 12)).toLowerCase();
+    const hasPercentMarker = /%|percent|אחוז/.test(around);
+    let pct = null;
+    if (hasPercentMarker) pct = n;
+    else if (n >= 0 && n <= 1) pct = n * 100;
+    else if (n > 1 && n <= 100) pct = n;
+    if (pct == null) continue;
+    if (pct < 0 || pct > 100) continue;
+    return pct;
+  }
+  return null;
+}
+
+function tryDeterministicQuantityAnswer(query, snippets, userLang) {
+  const material = detectQuantityIntent(query);
+  if (!material) return null;
+  const list = Array.isArray(snippets) ? snippets : [];
+  if (list.length === 0) return null;
+
+  const materialRe = new RegExp(escapeRegExp(material).replace(/\s+/g, '\\s+'), 'ig');
+  for (const s of list) {
+    const text = String(s?.text || s?.content || '').trim();
+    if (!text) continue;
+    let m;
+    while ((m = materialRe.exec(text)) !== null) {
+      const start = Math.max(0, m.index - 30);
+      const end = Math.min(text.length, m.index + m[0].length + 180);
+      const windowText = text.slice(start, end);
+      const pct = parsePercentFromSnippetWindow(windowText);
+      if (!Number.isFinite(pct)) continue;
+      const fmt = formatPercentValue(pct);
+      if (!fmt) continue;
+      if (userLang === 'he') return `הכמות של ${material} היא ${fmt}%.`;
+      return `The amount of ${material} is ${fmt}%.`;
+    }
+  }
+  return null;
+}
+
+function detectMaterialsListIntent(query) {
+  const q = String(query || '').trim();
+  if (!q) return false;
+  const listIntentRe =
+    /(רשימ(?:ת|ה)\s+ה?חומרים|אילו\s+חומרים|איזה\s+חומרים|כל\s+החומרים|חומרים\s+בפרויקט|materials?\s+(?:list|in\s+the\s+project|for\s+the\s+project)|list\s+of\s+materials?)/i;
+  return listIntentRe.test(q);
+}
+
+function buildDeterministicMaterialsListAnswer(materialsOverview, userLang) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) {
+    if (userLang === 'he') return 'כרגע אין חומרים מוגדרים לפרויקט זה בספריית החומרים.';
+    return 'There are currently no materials defined for this project in the materials library.';
+  }
+
+  const lines = [];
+  for (const row of list.slice(0, 80)) {
+    const name = String(row?.material_name || '').trim();
+    if (!name) continue;
+    const role = String(row?.role_or_function || '').trim();
+    if (userLang === 'he') lines.push(`- ${name}${role ? ` (תפקיד: ${role})` : ''}`);
+    else lines.push(`- ${name}${role ? ` (role: ${role})` : ''}`);
+  }
+  if (lines.length === 0) {
+    if (userLang === 'he') return 'כרגע אין חומרים מוגדרים לפרויקט זה בספריית החומרים.';
+    return 'There are currently no materials defined for this project in the materials library.';
+  }
+
+  if (userLang === 'he') {
+    return `רשימת החומרים בפרויקט:\n${lines.join('\n')}`;
+  }
+  return `Project materials list:\n${lines.join('\n')}`;
+}
+
+function detectMaterialsIntent(query) {
+  const q = String(query || '').trim();
+  if (!q) return false;
+  return /(חומר|חומרים|תפקיד|פונקציה|מרכיב|רכיב|material|materials|ingredient|ingredients|role|function)/i.test(q);
+}
+
+function buildProjectMaterialsMetadataContext(materialsOverview) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) return '';
+  const lines = [];
+  for (const row of list.slice(0, 120)) {
+    const name = String(row?.material_name || '').trim();
+    if (!name) continue;
+    const role = String(row?.role_or_function || '').trim();
+    const links = Array.isArray(row?.linked_experiments) ? row.linked_experiments : [];
+    const linkText = links
+      .slice(0, 10)
+      .map((l) => {
+        const eid = String(l?.experiment_id || '').trim();
+        const domain = String(l?.technology_domain || '').trim();
+        const outcome = String(l?.experiment_outcome || '').trim();
+        const hasPct = typeof l?.percentage === 'number' && Number.isFinite(l.percentage);
+        const pct = hasPct ? `${l.percentage}${l.unit || '%'}` : '';
+        return [eid ? `ניסוי ${eid}` : '', domain ? `תחום ${domain}` : '', outcome ? `תוצאה ${outcome}` : '', pct ? `כמות ${pct}` : '']
+          .filter(Boolean)
+          .join(', ');
+      })
+      .filter(Boolean)
+      .join(' | ');
+    lines.push(`- חומר: ${name}${role ? ` | תפקיד: ${role}` : ''}${linkText ? ` | קישורים: ${linkText}` : ''}`);
+  }
+  return lines.join('\n');
+}
+
+async function projectGptMaterialsSynthesisFromMetadata(userQuery, materialsOverview, opts = {}) {
+  const key = OPENAI_API_KEY;
+  if (!key) return '';
+  const lang = opts.lang === 'en' ? 'en' : 'he';
+  const noSupport = String(opts.noSupport || projectGptNoSupportMessage(lang));
+  const metaContext = buildProjectMaterialsMetadataContext(materialsOverview);
+  if (!metaContext.trim()) return '';
+
+  const systemContent =
+    `Reply in ${lang === 'he' ? 'Hebrew' : 'English'} only. ` +
+    'אתה שכבת תשובה ייעודית לשאלות חומרים בפרויקט. ' +
+    'השתמש אך ורק במטא־דאטה של ספריית החומרים שסופק כאן. ' +
+    'אסור להמציא, אסור להשתמש בידע חיצוני, אסור להסיק מעבר למה שמופיע. ' +
+    'אם המשתמש ביקש רשימה — החזר רשימה ברורה של חומרים ותפקיד (אם קיים). ' +
+    'אם נשאל על חומר ספציפי — התמקד בו, והצג תפקיד/ניסויים מקושרים רק אם מופיעים בהקשר. ' +
+    `אם אין מידע תומך, החזר בדיוק: ${noSupport}\n\n` +
+    `PROJECT MATERIALS METADATA:\n${metaContext}`;
+
+  const r = await axios.post(
+    `${OPENAI_API_BASE}/chat/completions`,
+    {
+      model: OPENAI_RAG_MODEL,
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: String(userQuery || '').trim().slice(0, 6000) }
+      ],
+      max_tokens: 700,
+      temperature: 0.1
+    },
+    {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      timeout: 90000
+    }
+  );
+  return String(r.data?.choices?.[0]?.message?.content || '').trim();
+}
+
 function buildProjectMaterialsRagAppendix(materialsOverview) {
   const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
   if (list.length === 0) return '';
@@ -4510,6 +4688,22 @@ function buildProjectMaterialsRagAppendix(materialsOverview) {
   }
   if (lines.length === 0) return '';
   return `\n\nPROJECT STRUCTURED CONTEXT (materials dictionary + experiment links):\n${lines.join('\n')}`;
+}
+
+function buildProjectMaterialsAlwaysChunk(materialsOverview) {
+  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
+  if (list.length === 0) return '';
+  const lines = [];
+  for (const row of list.slice(0, 24)) {
+    const name = String(row.material_name || '').trim();
+    if (!name) continue;
+    const role = row.role_or_function ? ` (תפקיד: ${String(row.role_or_function).trim()})` : '';
+    const links = Array.isArray(row.linked_experiments) ? row.linked_experiments : [];
+    const firstExp = links[0]?.experiment_id ? `, ניסוי לדוגמה: ${String(links[0].experiment_id).trim()}` : '';
+    lines.push(`- ${name}${role}${firstExp}`);
+  }
+  if (lines.length === 0) return '';
+  return `ספריית חומרים בפרויקט (מטא־דאטה מובנה בלבד):\n${lines.join('\n')}`;
 }
 
 function buildProjectMaterialGroundingSnippets(materialsOverview, query) {
@@ -4542,73 +4736,6 @@ function buildProjectMaterialGroundingSnippets(materialsOverview, query) {
   return picked.map((s) => ({ filename: s.filename, text: s.text }));
 }
 
-function buildProjectMaterialsSummarySnippet(materialsOverview) {
-  const list = Array.isArray(materialsOverview?.materials) ? materialsOverview.materials : [];
-  if (list.length === 0) return null;
-  const lines = [
-    'SOURCE_TYPE: material_library',
-    'PRIORITY: highest_for_material_questions',
-    'Material library (authoritative project metadata):'
-  ];
-  for (const row of list.slice(0, 180)) {
-    const name = String(row.material_name || '').trim();
-    if (!name) continue;
-    const role = row.role_or_function ? ` | role_or_function: ${String(row.role_or_function).trim()}` : '';
-    const links = Array.isArray(row.linked_experiments) ? row.linked_experiments : [];
-    const linkText = links
-      .slice(0, 6)
-      .map((l) => {
-        const eid = String(l.experiment_id || '').trim() || 'n/a';
-        const outcome = String(l.experiment_outcome || '').trim();
-        const pct = typeof l.percentage === 'number' ? `${l.percentage}${l.unit || '%'}` : '';
-        return `exp=${eid}${outcome ? `, outcome=${outcome}` : ''}${pct ? `, pct=${pct}` : ''}`;
-      })
-      .join('; ');
-    lines.push(`- material: ${name}${role}${linkText ? ` | links: ${linkText}` : ''}`);
-  }
-  return { filename: 'Project Metadata (Material Library)', text: lines.join('\n') };
-}
-
-function buildProjectGroundingSnippets(fileSnippets, materialSnippets, query) {
-  const qToks = tokenizeGptRagEvidence(String(query || ''));
-  const toRow = (s, idx, sourceType) => {
-    const text = String(s?.text || s?.content || '').trim();
-    if (!text) return null;
-    const base = scoreGptRagSnippet(text.toLowerCase(), qToks, []);
-    const sourceBoost = sourceType === 'material_library' ? 2 : 0;
-    return {
-      filename: String(s?.filename || 'Unknown'),
-      text,
-      _score: base + sourceBoost,
-      _sourceType: sourceType,
-      _idx: idx
-    };
-  };
-  const rows = [];
-  (Array.isArray(materialSnippets) ? materialSnippets : []).forEach((s, i) => {
-    const row = toRow(s, i, 'material_library');
-    if (row) rows.push(row);
-  });
-  (Array.isArray(fileSnippets) ? fileSnippets : []).forEach((s, i) => {
-    const row = toRow(s, i + 10000, 'file_search');
-    if (row) rows.push(row);
-  });
-  rows.sort((a, b) => b._score - a._score || a._idx - b._idx);
-
-  // Keep context tight but always keep at least one material snippet when available.
-  const cap = 12;
-  const picked = rows.slice(0, cap);
-  const hasMaterial = picked.some((r) => r._sourceType === 'material_library');
-  if (!hasMaterial) {
-    const firstMaterial = rows.find((r) => r._sourceType === 'material_library');
-    if (firstMaterial) {
-      if (picked.length >= cap) picked[picked.length - 1] = firstMaterial;
-      else picked.push(firstMaterial);
-    }
-  }
-  return picked.map((r) => ({ filename: r.filename, text: r.text }));
-}
-
 /**
  * User-visible answer for project GPT RAG: built from grounded snippets (live project files + project structured context).
  * The first Responses API message may reflect stale files still attached in OpenAI; do not use it as synthesis.
@@ -4631,9 +4758,6 @@ async function projectGptGroundedSynthesisFromSnippets(userQuery, snippets, opts
     'להלן ציטוטים בלבד מהמסמכים הרשומים כרגע בפרויקט במערכת הניהול — אסור להשתמש בתוכן מקבצים שנמחקו או שאינם מופיעים בציטוטים. ' +
     'אסור להמציא עובדות, להשלים פערים או להשתמש בידע כללי. מותר לקצר ולארגן ציטוטים למשפטים ברורים. ' +
     'שאלות כלליות: אפשר לשלב מספר ציטוטים לסיכום מבוסס־מקור — בלי פרטים שלא עולים מהציטוטים. ' +
-    'אם קיימים ציטוטים שמקורם "Project Metadata (Material Library)" והשאלה עוסקת בחומרים/שיוך חומרים לפרויקט/role_or_function — יש להשתמש במקור זה כמקור סמכות ראשי. ' +
-    'במצב כזה אסור להוסיף חומרים שלא מופיעים ב-Project Metadata גם אם הם מופיעים בקבצים אחרים, אלא לציין במפורש שהם אינם ברשימת הספרייה. ' +
-    'כאשר המשתמש מבקש "לפי רשימת חומרים" או "מהספרייה", התשובה חייבת להתבסס על Project Metadata בלבד. ' +
     `${RAG_MEASUREMENT_SCHEMA_RULES} ` +
     `אם אין בציטוטים מידע מספיק, השיבו במשפט אחד בדיוק: ${noSupport}\n\nציטוטים:\n` +
     context;
@@ -4812,6 +4936,7 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const projectId = req.params.projectId;
     const ctx = await requireProjectMember(req, res, projectId);
     if (!ctx) return;
+    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
     const q = (req.body && String(req.body.query || '').trim()) || '';
     const userLang = detectProjectGptUserLanguage(q);
     const noSupportMessage = projectGptNoSupportMessage(userLang);
@@ -4819,16 +4944,6 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       ? req.body.only_project_file_ids.map((x) => String(x || '').trim()).filter(Boolean)
       : [];
     if (!q) return res.status(400).json({ error: 'query is required' });
-
-    let materialsOverview = { materials: [], stats: { materials_count: 0, linked_experiments_count: 0, experiments_count: 0 } };
-    try {
-      materialsOverview = await buildProjectMaterialsOverview(projectId);
-    } catch (e) {
-      console.warn('[gpt-rag/query] materials overview unavailable:', e.message);
-    }
-    const materialsAppendix = buildProjectMaterialsRagAppendix(materialsOverview);
-
-    if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY not set on server' });
 
     const { data: project, error } = await supabase.from('projects').select('openai_vector_store_id').eq('id', projectId).single();
     if (error || !project) return res.status(404).json({ error: 'Project not found' });
@@ -4856,7 +4971,13 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
       return res.status(400).json({ error: 'No selected files found in this project scope.' });
     }
     const catalogAppendix = buildProjectFileCatalogAppendix(catalogRows || []);
-
+    let materialsOverview = { materials: [], stats: { materials_count: 0, linked_experiments_count: 0, experiments_count: 0 } };
+    try {
+      materialsOverview = await buildProjectMaterialsOverview(projectId);
+    } catch (e) {
+      console.warn('[gpt-rag/query] materials overview unavailable:', e.message);
+    }
+    const materialsAppendix = buildProjectMaterialsRagAppendix(materialsOverview);
     const languageAppendix =
       userLang === 'he'
         ? '\n\nLANGUAGE: Reply in Hebrew (עברית).'
@@ -4879,32 +5000,79 @@ app.post('/api/projects/:projectId/gpt-rag/query', limiterRag, async (req, res) 
     const rawSnippets = collectFileSearchSnippetsFromResponse(r.data);
     const fileSnippets = filterProjectGptSnippetsToIndex(rawSnippets, catalogRows || []);
     const materialSnippets = buildProjectMaterialGroundingSnippets(materialsOverview, q);
-    const materialSummary = buildProjectMaterialsSummarySnippet(materialsOverview);
-    const allMaterialSnippets = materialSummary ? [materialSummary, ...materialSnippets] : materialSnippets;
-    const snippets = buildProjectGroundingSnippets(fileSnippets, allMaterialSnippets, q);
+    const alwaysMaterialsChunk = buildProjectMaterialsAlwaysChunk(materialsOverview);
+    const alwaysMaterialSnippet = alwaysMaterialsChunk
+      ? [{ filename: 'Project Materials Context', text: alwaysMaterialsChunk }]
+      : [];
+    const snippets = [...fileSnippets, ...materialSnippets, ...alwaysMaterialSnippet];
     const hasUsableSnippets =
       Array.isArray(snippets) &&
       snippets.some((s) => String(s.text || s.content || '').trim().length > 0);
 
     let synthesis = noSupportMessage;
     if (hasUsableSnippets) {
-      try {
-        synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix + materialsAppendix, snippets, {
-          lang: userLang,
-          noSupport: noSupportMessage
-        });
-      } catch (e) {
-        console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
-        synthesis = noSupportMessage;
+      const materialIntent = detectMaterialsIntent(q);
+      if (materialIntent) {
+        try {
+          const materialSynthesis = await projectGptMaterialsSynthesisFromMetadata(q, materialsOverview, {
+            lang: userLang,
+            noSupport: noSupportMessage
+          });
+          if (materialSynthesis && materialSynthesis.length >= 2) synthesis = materialSynthesis;
+        } catch (e) {
+          console.warn('[gpt-rag/query] materials synthesis failed:', e.message);
+        }
+      }
+
+      if (!synthesis || synthesis === noSupportMessage) {
+        const deterministicMaterialList = detectMaterialsListIntent(q)
+          ? buildDeterministicMaterialsListAnswer(materialsOverview, userLang)
+          : null;
+        if (deterministicMaterialList) {
+          synthesis = deterministicMaterialList;
+        } else {
+          const deterministicQty = tryDeterministicQuantityAnswer(q, snippets, userLang);
+          if (deterministicQty) {
+            synthesis = deterministicQty;
+          } else {
+            try {
+              synthesis = await projectGptGroundedSynthesisFromSnippets(q + catalogAppendix + materialsAppendix, snippets, {
+                lang: userLang,
+                noSupport: noSupportMessage
+              });
+            } catch (e) {
+              console.warn('[gpt-rag/query] grounded synthesis failed:', e.message);
+              synthesis = noSupportMessage;
+            }
+          }
+        }
       }
       if (!synthesis || synthesis.length < 2) synthesis = noSupportMessage;
     }
     const sources = hasUsableSnippets ? dedupeAndCapSources(snippets, q, synthesis) : [];
+    const forcedMaterialsSource =
+      alwaysMaterialsChunk && String(alwaysMaterialsChunk).trim()
+        ? {
+            filename: 'Project Materials Context',
+            excerpt:
+              String(alwaysMaterialsChunk).length > GPT_RAG_SOURCE_EXCERPT_MAX
+                ? `${String(alwaysMaterialsChunk).slice(0, GPT_RAG_SOURCE_EXCERPT_MAX)}…`
+                : String(alwaysMaterialsChunk)
+          }
+        : null;
+    const finalSources = forcedMaterialsSource
+      ? (() => {
+          const base = Array.isArray(sources) ? [...sources] : [];
+          const already = base.some((s) => String(s?.filename || '').trim().toLowerCase() === 'project materials context');
+          if (!already) base.push(forcedMaterialsSource);
+          return base;
+        })()
+      : sources;
     res.json({
       run_id: r.data?.id || crypto.randomUUID(),
       outputs: { synthesis, research: synthesis, analysis: synthesis },
       justifications: [],
-      sources
+      sources: finalSources
     });
   } catch (e) {
     console.error('[gpt-rag/query]', e.response?.data || e.message);
