@@ -44,6 +44,8 @@ const PORT = parseInt(process.env.PORT, 10) || 8001;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const MATRIYA_BACK_URL = (process.env.MATRIYA_BACK_URL || '').replace(/\/$/, '');
+/** Optional: same value as MATRIYA_MANAGEMENT_MATERIALS_KEY on Matriya back — allows GET /api/matriya/projects-with-materials-summary without user JWT (server / curl / local dev). */
+const MANEGER_MATERIALS_SUMMARY_SERVER_KEY = (process.env.MANEGER_MATERIALS_SUMMARY_SERVER_KEY || '').trim();
 const SHAREPOINT_TENANT_ID = process.env.SHAREPOINT_TENANT_ID || '';
 const SHAREPOINT_CLIENT_ID = process.env.SHAREPOINT_CLIENT_ID || '';
 const SHAREPOINT_CLIENT_SECRET = process.env.SHAREPOINT_CLIENT_SECRET || '';
@@ -1715,6 +1717,44 @@ async function requireAuth(req, res) {
   return user;
 }
 
+function materialsSummaryServerKeyMatches(req) {
+  if (!MANEGER_MATERIALS_SUMMARY_SERVER_KEY) return false;
+  const sent = (req.get('x-matriya-materials-key') || req.get('X-Matriya-Materials-Key') || '').trim();
+  if (!sent) return false;
+  try {
+    const a = Buffer.from(MANEGER_MATERIALS_SUMMARY_SERVER_KEY, 'utf8');
+    const b = Buffer.from(sent, 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Matriya materials aggregate: JWT (via Matriya /auth/me) OR shared X-Matriya-Materials-Key when MANEGER_MATERIALS_SUMMARY_SERVER_KEY is set.
+ */
+async function authorizeMaterialsSummaryRequest(req, res) {
+  if (materialsSummaryServerKeyMatches(req)) {
+    return { user: { id: '__materials_summary_server__', username: 'admin' }, viaServerKey: true };
+  }
+  if (!MATRIYA_BACK_URL) {
+    res.status(503).json({
+      error:
+        'Auth not configured. Set MATRIYA_BACK_URL for JWT validation, or set MANEGER_MATERIALS_SUMMARY_SERVER_KEY and send header X-Matriya-Materials-Key.'
+    });
+    return null;
+  }
+  const user = await getCurrentUser(req);
+  if (!user) {
+    res.status(401).json({
+      error:
+        'Authentication required. Use Authorization: Bearer <Matriya JWT>, or X-Matriya-Materials-Key if MANEGER_MATERIALS_SUMMARY_SERVER_KEY is set on the server.'
+    });
+    return null;
+  }
+  return { user, viaServerKey: false };
+}
+
 app.get('/api/materials', async (req, res) => {
   try {
     const user = await requireAuth(req, res);
@@ -1727,6 +1767,234 @@ app.get('/api/materials', async (req, res) => {
       throw error;
     }
     res.json({ materials: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * Matriya «שאל על המסמכים» materials-library path: one response with catalog + every project the user can access
+ * and aggregated materials from lab_experiments (no N+1 from Matriya).
+ */
+function materialsFromLabExperimentRow(exp) {
+  const names = new Set();
+  const mats = exp?.materials;
+  if (Array.isArray(mats)) {
+    for (const m of mats) {
+      if (typeof m === 'string' && m.trim()) names.add(m.trim());
+      else if (m && typeof m === 'object') {
+        if (m.material_name) names.add(String(m.material_name).trim());
+        else if (m.name) names.add(String(m.name).trim());
+      }
+    }
+  }
+  const pct = exp?.percentages;
+  if (pct && typeof pct === 'object') {
+    for (const k of Object.keys(pct)) {
+      if (k && String(k).trim()) names.add(String(k).trim());
+    }
+  }
+  return [...names];
+}
+
+/** Per-project material_library rows for aggregate + catalog merge (real data lives here, not always in `materials`). */
+async function fetchMaterialLibraryForSummary(projectIds) {
+  if (!projectIds.length) return [];
+  const { data, error } = await supabase
+    .from('material_library')
+    .select('id, project_id, name, role_or_function')
+    .in('project_id', projectIds)
+    .order('name');
+  if (error) {
+    const msg = String(error.message || '');
+    if (msg.includes('does not exist') || msg.includes('relation')) return [];
+    throw error;
+  }
+  return data || [];
+}
+
+function groupMaterialLibraryByProject(libRows) {
+  const m = new Map();
+  for (const r of libRows || []) {
+    const pid = r.project_id;
+    if (!pid) continue;
+    if (!m.has(pid)) m.set(pid, []);
+    m.get(pid).push(r);
+  }
+  return m;
+}
+
+function mergeMaterialsCatalogFromLibrary(matCat, libRows, projNameById) {
+  const base = Array.isArray(matCat) ? matCat : [];
+  const fromLib = (libRows || []).map((r) => ({
+    material_id: r.id,
+    material_name: r.name,
+    project_id: r.project_id,
+    project_name: projNameById.get(r.project_id) ?? '',
+    role_or_function: r.role_or_function != null ? r.role_or_function : null,
+    technology_domain: null
+  }));
+  const merged = [...base, ...fromLib];
+  merged.sort((a, b) => {
+    const na = String(a.material_name ?? a.name ?? '').toLowerCase();
+    const nb = String(b.material_name ?? b.name ?? '').toLowerCase();
+    return na.localeCompare(nb);
+  });
+  return merged;
+}
+
+function slimMaterialLibraryForPayload(rows) {
+  return (rows || []).map((r) => ({
+    id: r.id,
+    name: r.name,
+    role_or_function: r.role_or_function != null ? r.role_or_function : null
+  }));
+}
+
+app.get('/api/matriya/projects-with-materials-summary', async (req, res) => {
+  try {
+    const auth = await authorizeMaterialsSummaryRequest(req, res);
+    if (!auth) return;
+    const { user, viaServerKey } = auth;
+
+    const maxExps = Math.min(500, Math.max(5, parseInt(req.query.max_experiments_per_project, 10) || 200));
+
+    const isAdmin =
+      viaServerKey || String(user.username || '').trim().toLowerCase() === 'admin';
+
+    let projectIds = [];
+    if (isAdmin) {
+      const { data: allP, error: pe } = await supabase.from('projects').select('id');
+      if (pe) throw pe;
+      projectIds = (allP || []).map((p) => p.id).filter(Boolean);
+    } else {
+      const { data: mem, error: me } = await supabase
+        .from('project_members')
+        .select('project_id')
+        .eq('user_id', user.id);
+      if (me) throw me;
+      projectIds = [...new Set((mem || []).map((m) => m.project_id).filter(Boolean))];
+    }
+
+    const { data: matCat, error: matErr } = await supabase.from('materials').select('*').order('material_name');
+    if (matErr && !String(matErr.message || '').includes('does not exist') && !String(matErr.message || '').includes('relation')) {
+      throw matErr;
+    }
+
+    if (!projectIds.length) {
+      const materialsCatalog = Array.isArray(matCat) ? matCat : [];
+      return res.json({ projects: [], materials_catalog: materialsCatalog });
+    }
+
+    const { data: projects, error: projErr } = await supabase
+      .from('projects')
+      .select('id, name, description, updated_at')
+      .in('id', projectIds)
+      .order('updated_at', { ascending: false });
+    if (projErr) throw projErr;
+
+    const projNameById = new Map((projects || []).map((p) => [p.id, p.name]));
+    let libRows = [];
+    try {
+      libRows = await fetchMaterialLibraryForSummary(projectIds);
+    } catch (libE) {
+      const msg = String(libE.message || '');
+      if (!msg.includes('does not exist') && !msg.includes('relation')) throw libE;
+    }
+    const libByProject = groupMaterialLibraryByProject(libRows);
+    const materialsCatalog = mergeMaterialsCatalogFromLibrary(matCat, libRows, projNameById);
+
+    const { data: experiments, error: exErr } = await supabase
+      .from('lab_experiments')
+      .select(
+        'project_id, experiment_id, experiment_version, technology_domain, materials, percentages, experiment_outcome, formula, updated_at'
+      )
+      .in('project_id', projectIds);
+
+    if (exErr) {
+      const msg = String(exErr.message || '');
+      if (msg.includes('does not exist') || msg.includes('relation')) {
+        const outProjects = (projects || []).map((p) => {
+          const libForP = libByProject.get(p.id) || [];
+          const union = new Set();
+          for (const r of libForP) {
+            if (r.name && String(r.name).trim()) union.add(String(r.name).trim());
+          }
+          return {
+            id: p.id,
+            name: p.name,
+            description: p.description,
+            updated_at: p.updated_at,
+            material_library: slimMaterialLibraryForPayload(libForP),
+            materials_union: [...union].sort((a, b) => a.localeCompare(b)),
+            experiment_count: 0,
+            experiments: [],
+            experiments_truncated: false
+          };
+        });
+        return res.json({
+          projects: outProjects,
+          materials_catalog: materialsCatalog,
+          warning: 'lab_experiments not available'
+        });
+      }
+      throw exErr;
+    }
+
+    const exByProject = new Map();
+    for (const exp of experiments || []) {
+      const pid = exp.project_id;
+      if (!pid) continue;
+      if (!exByProject.has(pid)) exByProject.set(pid, []);
+      exByProject.get(pid).push(exp);
+    }
+
+    const totals = new Map();
+    for (const [pid, list] of exByProject) {
+      totals.set(pid, list.length);
+      list.sort((a, b) => {
+        const ta = new Date(a.updated_at || 0).getTime();
+        const tb = new Date(b.updated_at || 0).getTime();
+        return tb - ta;
+      });
+      exByProject.set(pid, list.slice(0, maxExps));
+    }
+
+    const outProjects = (projects || []).map((p) => {
+      const exps = exByProject.get(p.id) || [];
+      const total = totals.get(p.id) || 0;
+      const union = new Set();
+      const libForP = libByProject.get(p.id) || [];
+      for (const r of libForP) {
+        if (r.name && String(r.name).trim()) union.add(String(r.name).trim());
+      }
+      const slimExps = [];
+      for (const exp of exps) {
+        const m = materialsFromLabExperimentRow(exp);
+        m.forEach((x) => union.add(x));
+        slimExps.push({
+          experiment_id: exp.experiment_id,
+          experiment_version: exp.experiment_version,
+          technology_domain: exp.technology_domain,
+          experiment_outcome: exp.experiment_outcome,
+          materials: m,
+          formula: exp.formula != null ? String(exp.formula).slice(0, 500) : null
+        });
+      }
+      return {
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        updated_at: p.updated_at,
+        material_library: slimMaterialLibraryForPayload(libForP),
+        materials_union: [...union].sort((a, b) => a.localeCompare(b)),
+        experiment_count: total,
+        experiments: slimExps,
+        experiments_truncated: total > exps.length
+      };
+    });
+
+    res.json({ projects: outProjects, materials_catalog: materialsCatalog });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
